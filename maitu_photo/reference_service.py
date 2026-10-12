@@ -217,8 +217,14 @@ def _normalize_legacy_tags(
 def validate_reference_tags(
     category: ReferenceCategory | str,
     value: Mapping[str, Any] | object,
+    *,
+    partial: bool = False,
 ) -> TagValidationResult:
-    """Validate and normalize model tags against the category's exact schema."""
+    """Validate category tags, or a strictly typed partial manual override.
+
+    Partial objects may omit any field, including every field to clear manual
+    overrides.  Unlike legacy model output, they may not include retired keys.
+    """
 
     category = ReferenceCategory(category)
     if not isinstance(value, Mapping):
@@ -230,7 +236,8 @@ def validate_reference_tags(
             errors=("tags must be a JSON object",),
         )
 
-    value = _normalize_legacy_tags(category, value)
+    if not partial:
+        value = _normalize_legacy_tags(category, value)
     expected = set(_TAG_FIELDS[category])
     actual = {key for key in value if isinstance(key, str)}
     errors: list[str] = []
@@ -238,7 +245,7 @@ def validate_reference_tags(
         errors.append("all tag field names must be strings")
     missing = sorted(expected - actual)
     extra = sorted(actual - expected)
-    if missing:
+    if missing and not partial:
         errors.append("missing fields: " + ", ".join(missing))
     if extra:
         errors.append("unexpected fields: " + ", ".join(extra))
@@ -264,7 +271,7 @@ def validate_reference_tags(
             else:
                 normalized[key] = item
         elif key == "confidence":
-            if isinstance(item, bool) or not isinstance(item, (int, float)) or not 0 <= float(item) <= 1:
+            if isinstance(item, bool) or not isinstance(item, (int, float)) or not 0 <= item <= 1:
                 errors.append("confidence must be a number between 0 and 1")
             else:
                 normalized[key] = float(item)
@@ -281,8 +288,8 @@ def validate_reference_tags(
             errors=tuple(errors),
         )
 
-    tags = {key: normalized[key] for key in _TAG_FIELDS[category]}
-    if category == ReferenceCategory.SCENE and not tags["privacy_eligible"]:
+    tags = {key: normalized[key] for key in _TAG_FIELDS[category] if key in normalized}
+    if category == ReferenceCategory.SCENE and tags.get("privacy_eligible") is False:
         return TagValidationResult(
             tags=tags,
             schema_valid=True,
@@ -317,6 +324,10 @@ class ReferenceService:
         data_dir: Path | str,
         config: ReferenceServiceConfig | None = None,
         before_provider_request: Callable[[], None] | None = None,
+        before_tag_request: Callable[[], None] | None = None,
+        after_persist: Callable[[ReferenceAsset], None] | None = None,
+        check_mutation: Callable[[], None] | None = None,
+        mutation_lock: asyncio.Lock | None = None,
     ) -> None:
         self.gallery = gallery
         self.provider = provider
@@ -324,7 +335,10 @@ class ReferenceService:
         self.data_dir = Path(data_dir).resolve()
         self.config = config or ReferenceServiceConfig()
         self._before_provider_request = before_provider_request
-        self._mutation_lock = asyncio.Lock()
+        self._before_tag_request = before_tag_request
+        self._after_persist = after_persist
+        self._check_mutation = check_mutation
+        self._mutation_lock = mutation_lock if mutation_lock is not None else asyncio.Lock()
 
     async def import_reference(
         self,
@@ -336,16 +350,18 @@ class ReferenceService:
         manual_tags: Mapping[str, Any] | None = None,
         source_task_id: str | None = None,
         prompt_version: str = "",
+        prepared_source: CompressionResult | None = None,
+        replaces_asset_id: str | None = None,
     ) -> ReferenceAsset:
-        """Import an already prepared reference image.
+        """Import a reference, deduplicating processed bytes before tagging.
 
-        The uploaded bytes are still normalized twice through the common
-        compression pipeline: once for the retained source and once for the
-        selectable reference artifact.
+        Uploads are normalized once for the retained source and once for the
+        reference artifact.  A trusted staging layer may supply the first
+        compression result to keep staged and direct imports byte-identical.
         """
 
-        category = self._validate_request(category, name, replace_person)
-        source_result = await self._compress(source)
+        category = self._validate_request(category, name, replace_person, check_person=False)
+        source_result = prepared_source if prepared_source is not None else await self._compress(source)
         reference_result = await self._compress(source_result.data)
         return await self._persist_new(
             category=category,
@@ -357,6 +373,7 @@ class ReferenceService:
             source_task_id=source_task_id,
             prompt_version=prompt_version or self._prompt_version("import", self.config.prompts.tagging_for(category)),
             source_kind="admin_import",
+            replaces_asset_id=replaces_asset_id,
         )
 
     async def generate_person_from_personality(
@@ -412,11 +429,13 @@ class ReferenceService:
         extraction_prompt: str = "",
         prompt_version: str = "",
         size: str = "",
+        prepared_source: CompressionResult | None = None,
+        replaces_asset_id: str | None = None,
     ) -> ReferenceAsset:
         """Generate the category's multi-angle reference board from an upload."""
 
         category = self._validate_request(category, name, replace_person)
-        source_result = await self._compress(source)
+        source_result = prepared_source if prepared_source is not None else await self._compress(source)
         prompt = extraction_prompt or self.config.prompts.extraction_for(category)
         generated = await self._generate_reference(
             source_result.data,
@@ -435,6 +454,7 @@ class ReferenceService:
             prompt_version=prompt_version or self._prompt_version("extract", prompt),
             source_kind="model_extract",
             provider_media_type=generated.media_type,
+            replaces_asset_id=replaces_asset_id,
         )
 
     async def retag_reference(
@@ -449,15 +469,27 @@ class ReferenceService:
         reference_result = await self._compress(asset.reference_path)
         prompt = tagging_prompt or self.config.prompts.tagging_for(asset.category)
         tagging = await self._tag(asset.category, reference_result.data, prompt=prompt)
-        updated = self.gallery.apply_generated_tags(
-            asset.id,
-            tagging.tags,
-            valid=tagging.selectable,
-            auto_enable=self.config.auto_enable_generated_references,
-        )
-        updated.selection_metadata.update(self._tagging_metadata(tagging, reference_result))
-        updated.prompt_version = self._prompt_version("retag", prompt)
-        return self.gallery.storage.update_reference_asset(updated)
+        async with self._mutation_lock:
+            with self.gallery.storage.transaction():
+                self._ensure_mutation_allowed()
+                # Reload administrator overrides/status under the commit lock;
+                # tagging may have yielded while the asset was edited/deleted.
+                updated = self.gallery.require(asset.id)
+                previous_status = updated.status
+                if tagging.schema_valid:
+                    updated.tags = dict(tagging.tags)
+                effective = self._effective_tagging(updated.category, tagging, updated.manual_tags)
+                if not effective.selectable:
+                    updated.status = AssetStatus.NEEDS_REVIEW
+                elif previous_status in (AssetStatus.ACTIVE, AssetStatus.DISABLED):
+                    updated.status = previous_status
+                else:
+                    updated.status = self._status_for(effective)
+                updated.selection_metadata.update(self._tagging_metadata(effective, reference_result))
+                updated.prompt_version = self._prompt_version("retag", prompt)
+                updated = self.gallery.storage.update_reference_asset(updated)
+                self._notify_persisted(updated)
+                return updated
 
     async def regenerate_reference(
         self,
@@ -487,20 +519,12 @@ class ReferenceService:
         reference_result = await self._compress(generated.data)
 
         if reference_result.sha256 == old.sha256:
-            tagging = await self._tag(
-                old.category,
-                reference_result.data,
-                prompt=self.config.prompts.tagging_for(old.category),
-            )
-            updated = self.gallery.apply_generated_tags(
-                old.id,
-                tagging.tags,
-                valid=tagging.selectable,
-                auto_enable=self.config.auto_enable_generated_references,
-            )
-            updated.selection_metadata.update(self._tagging_metadata(tagging, reference_result))
-            updated.prompt_version = prompt_version or self._prompt_version("regenerate", prompt)
-            return self.gallery.storage.update_reference_asset(updated)
+            async with self._mutation_lock:
+                with self.gallery.storage.transaction():
+                    self._ensure_mutation_allowed()
+                    unchanged = self.gallery.require(old.id)
+                    self._notify_persisted(unchanged)
+                    return unchanged
 
         replacement = await self._persist_new(
             category=old.category,
@@ -522,11 +546,13 @@ class ReferenceService:
         category: ReferenceCategory | str,
         name: str,
         replace_person: bool,
+        *,
+        check_person: bool = True,
     ) -> ReferenceCategory:
         category = ReferenceCategory(category)
         if not isinstance(name, str) or not name.strip():
             raise ValueError("reference name must not be empty")
-        if category == ReferenceCategory.PERSON:
+        if check_person and category == ReferenceCategory.PERSON:
             current = self.gallery.get_person()
             if current is not None and not replace_person:
                 raise DuplicateReferenceError(
@@ -573,6 +599,9 @@ class ReferenceService:
             kwargs["moderation"] = self.config.extraction_moderation
         if self.config.extraction_extra_params:
             kwargs["extra"] = dict(self.config.extraction_extra_params)
+        if isinstance(self.provider, OpenAICompatibleProvider):
+            kwargs["retry_limit"] = 0
+        self._ensure_mutation_allowed()
         if self._before_provider_request is not None:
             self._before_provider_request()
         try:
@@ -597,6 +626,9 @@ class ReferenceService:
         *,
         prompt: str,
     ) -> TagValidationResult:
+        self._ensure_mutation_allowed()
+        if self._before_tag_request is not None:
+            self._before_tag_request()
         try:
             result = await self.llm.generate_json(
                 prompt,
@@ -633,12 +665,28 @@ class ReferenceService:
         provider_media_type: str = "",
         replaces_asset_id: str | None = None,
     ) -> ReferenceAsset:
+        # Direct imports arrive here before any model request.  Do not retag,
+        # rename, re-enable, or otherwise mutate a byte-identical live record.
+        async with self._mutation_lock:
+            with self.gallery.storage.transaction():
+                self._ensure_mutation_allowed()
+                existing = self.gallery.storage.find_reference_by_hash(category, reference_result.sha256)
+                if existing is not None:
+                    self._notify_persisted(existing)
+                    return existing
+                self._validate_request(category, name, replace_person)
+                self._require_replacement(replaces_asset_id, category)
+                manual = validate_reference_tags(category, manual_tags if manual_tags is not None else {}, partial=True)
+                if not manual.schema_valid:
+                    raise ReferenceTagValidationError(manual.errors)
+
         tagging = await self._tag(
             category,
             reference_result.data,
             prompt=self.config.prompts.tagging_for(category),
         )
-        status = self._status_for(tagging)
+        effective = self._effective_tagging(category, tagging, manual.tags)
+        status = self._status_for(effective)
         token = uuid4().hex
         source_path = self._artifact_path("sources", category, token)
         reference_path = self._artifact_path("references", category, token)
@@ -646,11 +694,23 @@ class ReferenceService:
         async with self._mutation_lock:
             written: list[Path] = []
             try:
-                self._atomic_write(source_path, source_result.data)
-                written.append(source_path)
-                self._atomic_write(reference_path, reference_result.data)
-                written.append(reference_path)
                 with self.gallery.storage.transaction():
+                    self._ensure_mutation_allowed()
+                    # Tagging yielded: another ingestion may now own this hash.
+                    # Recheck before writing so a duplicate never leaks files or
+                    # deletes the target it was supposed to replace.
+                    existing = self.gallery.storage.find_reference_by_hash(category, reference_result.sha256)
+                    if existing is not None:
+                        self._notify_persisted(existing)
+                        return existing
+                    self._validate_request(category, name, replace_person)
+                    self._require_replacement(replaces_asset_id, category)
+                    # Track the paths before writing, including failures raised
+                    # just after an atomic replace has made a file visible.
+                    written.append(source_path)
+                    self._atomic_write(source_path, source_result.data)
+                    written.append(reference_path)
+                    self._atomic_write(reference_path, reference_result.data)
                     asset = self.gallery.add_reference(
                         category=category,
                         name=name.strip(),
@@ -658,7 +718,7 @@ class ReferenceService:
                         reference_path=reference_path,
                         sha256=reference_result.sha256,
                         tags=tagging.tags,
-                        manual_tags=dict(manual_tags or {}),
+                        manual_tags=manual.tags,
                         prompt_version=prompt_version,
                         status=status,
                         source_task_id=source_task_id,
@@ -668,13 +728,14 @@ class ReferenceService:
                             "source_compression": source_result.to_dict(),
                             "reference_compression": reference_result.to_dict(),
                             "provider_media_type": provider_media_type,
-                            **self._tagging_metadata(tagging, reference_result),
+                            **self._tagging_metadata(effective, reference_result),
                         },
                         replace_person=replace_person,
                     )
                     if replaces_asset_id is not None and category != ReferenceCategory.PERSON:
                         self.gallery.soft_delete(replaces_asset_id)
-            except Exception:
+                    self._notify_persisted(asset)
+            except BaseException:
                 for path in written:
                     try:
                         path.unlink(missing_ok=True)
@@ -682,6 +743,31 @@ class ReferenceService:
                         pass
                 raise
         return asset
+
+    def _ensure_mutation_allowed(self) -> None:
+        if self._check_mutation is not None:
+            self._check_mutation()
+
+    def _notify_persisted(self, asset: ReferenceAsset) -> None:
+        if self._after_persist is not None:
+            self._after_persist(asset)
+
+    def _require_replacement(self, asset_id: str | None, category: ReferenceCategory) -> None:
+        if asset_id is not None and self.gallery.require(asset_id).category != category:
+            raise ValueError("replacement reference category does not match")
+
+    @staticmethod
+    def _effective_tagging(
+        category: ReferenceCategory,
+        tagging: TagValidationResult,
+        manual_tags: Mapping[str, Any],
+    ) -> TagValidationResult:
+        # A failed/malformed model response remains a review item even if manual
+        # overrides could reconstruct a complete schema.  Valid model tags may
+        # be corrected or disqualified by administrator overrides.
+        if not tagging.schema_valid:
+            return tagging
+        return validate_reference_tags(category, {**tagging.tags, **manual_tags})
 
     def _status_for(self, tagging: TagValidationResult) -> AssetStatus:
         if not tagging.selectable:

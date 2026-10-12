@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from maitu_photo.config import PhotoPluginConfig
 from maitu_photo.models import ReferenceAsset, ReferenceCategory
@@ -21,7 +24,9 @@ def test_manifest_declares_host_config_capability() -> None:
     manifest = json.loads((Path(__file__).parents[1] / "_manifest.json").read_text(encoding="utf-8"))
 
     assert "config.get" in manifest["capabilities"]
-    assert manifest["host_application"]["min_version"] == "1.1.4"
+    assert manifest["host_application"]["min_version"] == "1.3.6"
+    assert manifest["sdk"]["min_version"] == "2.12.0"
+    assert "webui.claim_upload" in manifest["capabilities"]
 
 
 def test_component_metadata_uses_configured_descriptions_and_prefix() -> None:
@@ -55,7 +60,37 @@ def test_components_can_be_discovered_before_config_injection() -> None:
         "generate_scene_photo",
         "generate_photo",
         "get_image_task_status",
+        "webui_gallery_query",
+        "webui_task_query",
+        "webui_gallery_action",
+        "webui_stage_upload",
     }
+
+
+def test_webui_apis_are_static_private_components() -> None:
+    plugin = MaiTuPhotoPlugin()
+    components = {item["name"]: item for item in plugin.get_components()}
+    for name in ("webui_gallery_query", "webui_task_query", "webui_gallery_action", "webui_stage_upload"):
+        declaration = components[name]
+        assert str(declaration["type"]).casefold() == "api"
+        assert declaration["metadata"]["public"] is False
+        assert declaration["metadata"]["version"] == "1"
+        assert declaration["metadata"]["handler_name"] == name
+        assert declaration["metadata"].get("dynamic", False) is False
+
+
+def test_qq_gallery_guard_uses_the_shared_service_reference_protection() -> None:
+    calls: list[str] = []
+
+    def reject_busy_reference(asset_id: str) -> None:
+        calls.append(asset_id)
+        raise ValueError("参考图正在被生图任务使用，请稍后再修改")
+
+    plugin = MaiTuPhotoPlugin()
+    plugin._service = SimpleNamespace(ensure_reference_idle=reject_busy_reference)  # type: ignore[assignment]
+    with pytest.raises(ValueError, match="生图任务使用"):
+        plugin._ensure_asset_idle("a" * 32)
+    assert calls == ["a" * 32]
 
 
 def test_gallery_tool_is_never_registered_for_planner() -> None:

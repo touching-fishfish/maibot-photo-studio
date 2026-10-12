@@ -5,6 +5,8 @@ logs/
 .dev/
 .venv/
 *.egg-info/
+/dist/
+/build/
 __pycache__/
 *.py[cod]
 .pytest_cache/

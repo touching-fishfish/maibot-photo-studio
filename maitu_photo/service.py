@@ -14,10 +14,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from .compression import CompressionConfig
+from .compression import CompressionConfig, CompressionResult
 from .config import PhotoPluginConfig
 from .continuity import ContinuityManager, normalize_scene_signature
-from .gallery import DuplicateReferenceError, ReferenceGallery, file_sha256
+from .gallery import DuplicateReferenceError, ReferenceGallery, ReferenceVersionConflictError, file_sha256
 from .llm_adapter import MaiBotLLMAdapter
 from .logging_utils import PluginEventLogger, diagnostic_error, redact_text
 from .models import (
@@ -35,7 +35,7 @@ from .reference_service import (
     ReferenceService,
     ReferenceServiceConfig,
 )
-from .runtime import InvocationContext
+from .runtime import InvocationContext, ReferenceJobContext
 from .selection import ReferenceSelector, SelectionResult
 from .storage import RecordNotFoundError, SQLiteStorage, StorageError
 from .task_manager import TaskManager
@@ -163,6 +163,11 @@ class PhotoStudioService:
         )
         self.payloads = TaskPayloadStore(self.data_dir)
         self._provider: OpenAICompatibleProvider | None = None
+        # Gallery mutations share one lock across short-lived ReferenceService
+        # instances. A separate job lock serializes reference operations (and
+        # startup ingestion) without locking ordinary photo generation.
+        self.reference_mutation_lock = asyncio.Lock()
+        self._reference_job_lock = asyncio.Lock()
         self._reference_scan_task: asyncio.Task[dict[str, int]] | None = None
         self.tasks = TaskManager(
             self.storage,
@@ -177,6 +182,7 @@ class PhotoStudioService:
     async def start(self) -> None:
         cleanup = self.cleanup_expired()
         await self.tasks.start()
+        self._reconcile_reference_receipts()
         self.log.info(
             "后台任务服务已启动",
             worker_count=self.config.tasks.worker_count,
@@ -221,9 +227,13 @@ class PhotoStudioService:
         ingestion path and the original drop file is then removed.
         """
 
+        async with self._reference_job_lock:
+            return await self._scan_reference_folders_locked()
+
+    async def _scan_reference_folders_locked(self) -> dict[str, int]:
         result = self._empty_reference_scan_result()
         registered_paths = self._registered_reference_paths()
-        reference_service = self._reference_service(require_provider=False)
+        attempted_drops = self._startup_reference_attempts()
 
         for category in ReferenceCategory:
             directory = (self.data_dir / "references" / category.value).resolve()
@@ -256,6 +266,7 @@ class PhotoStudioService:
                         )
                         continue
 
+                scan_task: ImageTask | None = None
                 try:
                     raw_digest = await asyncio.to_thread(file_sha256, candidate)
                     existing = self.storage.find_reference_by_hash(category, raw_digest)
@@ -269,11 +280,49 @@ class PhotoStudioService:
                         )
                         continue
 
+                    drop_key = (category.value, candidate.name, raw_digest)
+                    if drop_key in attempted_drops:
+                        # A previous crash may have happened after the tagging
+                        # call was sent. Keep the drop for explicit admin retry;
+                        # startup must not issue another paid call automatically.
+                        result["skipped"] += 1
+                        self.log.warning(
+                            "启动扫描保留已尝试的参考图",
+                            category=category.value,
+                            file_name=candidate.name,
+                        )
+                        continue
+                    scan_task = self._new_task(
+                        kind="reference_import",
+                        invocation=ReferenceJobContext(),
+                        prompt_text=candidate.stem,
+                        request={
+                            "operation": "import",
+                            "category": category.value,
+                            "origin": "startup",
+                            "delivery": "none",
+                            "automatic": True,
+                            "drop_name": candidate.name,
+                            "drop_sha256": raw_digest,
+                        },
+                    )
+                    # Run the original direct import, not a worker-wait loop:
+                    # photo workers can already be awaiting this startup scan.
+                    scan_task.status = TaskStatus.RUNNING
+                    self.storage.create_task(scan_task)
+                    reference_service = self._reference_service(
+                        require_provider=False,
+                        before_tag_request=lambda task=scan_task: self.storage.mark_task_request_started(task.id),
+                        check_mutation=lambda task=scan_task: self._check_reference_mutation(task, {}),
+                        after_persist=lambda asset, task=scan_task: self._record_reference_completion(task.id, asset),
+                    )
                     asset = await reference_service.import_reference(
                         category,
                         candidate,
                         name=candidate.stem.strip() or f"startup-{category.value}",
+                        source_task_id=scan_task.id,
                     )
+                    attempted_drops.add(drop_key)
                     if candidate.resolve() != asset.reference_path.resolve():
                         candidate.unlink(missing_ok=True)
                     registered_paths.add(asset.reference_path.resolve())
@@ -286,6 +335,12 @@ class PhotoStudioService:
                         asset_status=asset.status.value,
                     )
                 except DuplicateReferenceError as exc:
+                    if scan_task is not None:
+                        self.storage.set_task_status(
+                            scan_task.id,
+                            TaskStatus.FAILED,
+                            error_message="startup reference conflict",
+                        )
                     if category == ReferenceCategory.PERSON:
                         result["person_conflicts"] += 1
                         self.log.warning(
@@ -312,6 +367,14 @@ class PhotoStudioService:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001 - one bad drop must not stop startup
+                    if scan_task is not None:
+                        latest = self.storage.get_task(scan_task.id)
+                        if latest is not None and latest.status not in {TaskStatus.SENT, TaskStatus.CANCELLED}:
+                            self.storage.set_task_status(
+                                scan_task.id,
+                                TaskStatus.FAILED,
+                                error_message=_safe_error(exc),
+                            )
                     result["errors"] += 1
                     self.log.warning(
                         "启动扫描无法导入参考图",
@@ -321,6 +384,26 @@ class PhotoStudioService:
                     )
 
         return result
+
+    def _startup_reference_attempts(self) -> set[tuple[str, str, str]]:
+        attempts: set[tuple[str, str, str]] = set()
+        offset = 0
+        while True:
+            tasks = self.storage.list_tasks(limit=10_000, offset=offset)
+            for task in tasks:
+                if task.request.get("origin") == "startup" and (
+                    task.paid_request_started or task.status == TaskStatus.SENT
+                ):
+                    attempts.add(
+                        (
+                            str(task.request.get("category") or ""),
+                            str(task.request.get("drop_name") or ""),
+                            str(task.request.get("drop_sha256") or ""),
+                        )
+                    )
+            if len(tasks) < 10_000:
+                return attempts
+            offset += len(tasks)
 
     async def _run_startup_reference_scan(self) -> dict[str, int]:
         try:
@@ -492,33 +575,131 @@ class PhotoStudioService:
         appearance_hint: str = "",
         size: str = "",
     ) -> ImageTask:
+        return self._queue_reference_job(
+            invocation,
+            payload={
+                "operation": operation,
+                "category": ReferenceCategory(category).value if category is not None else "",
+                "name": name.strip(),
+                "asset_id": asset_id.strip(),
+                "manual_tags": dict(manual_tags or {}),
+                "automatic": bool(automatic),
+                "origin": "automatic" if automatic else "qq",
+                "delivery": "qq",
+                "personality": personality.strip(),
+                "nickname": nickname.strip(),
+                "appearance_hint": appearance_hint.strip(),
+                "size": size.strip(),
+            },
+            image=image,
+            parent_task_id=parent_task_id,
+        )
+
+    def submit_webui_reference_job(
+        self,
+        *,
+        operation: str,
+        category: ReferenceCategory | str = "",
+        name: str = "",
+        image: bytes | None = None,
+        asset_id: str = "",
+        batch_id: str = "",
+        request_id: str = "",
+        expected_version: str = "",
+        person_version: str = "",
+        appearance_hint: str = "",
+        source_metadata: Mapping[str, Any] | None = None,
+        personality: str = "",
+        nickname: str = "",
+    ) -> ImageTask:
+        """Queue an authenticated server-side gallery job with no chat delivery.
+
+        The API owns authorization, confirmation and upload normalization. This
+        synchronous method can participate in its request-receipt transaction.
+        Versions are checked again by the worker before paid calls and commit.
+        """
+
         operation = operation.strip().casefold()
+        category_value = ReferenceCategory(category).value if category else ""
+        asset_id = asset_id.strip()
+        if operation in {"retag", "regenerate", "replace"}:
+            if not asset_id or not expected_version.strip():
+                raise ValueError("现有参考图任务必须提供 asset_id 和 expected_version")
+            target = self.gallery.require(asset_id)
+            if category_value and target.category.value != category_value:
+                raise ValueError("参考图任务分类与目标不一致")
+            category_value = target.category.value
+        if operation == "generate_person":
+            category_value = ReferenceCategory.PERSON.value
+            if self.gallery.get_person() is not None:
+                raise PhotoStudioError("已有人物参考图，不能再次从人格生成人物")
+            if not personality.strip():
+                raise PhotoStudioError("未能读取 MaiBot 人格设定，无法生成人物参考图")
+        if not category_value:
+            raise ValueError("参考图任务缺少 category")
+        if category_value == ReferenceCategory.PERSON.value and not person_version.strip():
+            raise ValueError("人物参考图任务必须提供 person_version")
+        if operation in {"import", "extract", "replace"} and not image:
+            raise ValueError("参考图任务缺少上传图片")
+        return self._queue_reference_job(
+            ReferenceJobContext(),
+            payload={
+                "operation": operation,
+                "category": category_value,
+                "name": name.strip(),
+                "asset_id": asset_id,
+                "batch_id": batch_id.strip(),
+                "request_id": request_id.strip(),
+                "expected_version": expected_version.strip(),
+                "person_version": person_version.strip(),
+                "automatic": False,
+                "origin": "webui",
+                "delivery": "none",
+                "appearance_hint": appearance_hint.strip(),
+                "personality": personality.strip(),
+                "nickname": nickname.strip(),
+                "source_compression": dict(source_metadata or {}),
+            },
+            image=image,
+        )
+
+    def _queue_reference_job(
+        self,
+        invocation: InvocationContext | ReferenceJobContext,
+        *,
+        payload: Mapping[str, Any],
+        image: bytes | None = None,
+        parent_task_id: str | None = None,
+    ) -> ImageTask:
+        payload = dict(payload)
+        operation = str(payload["operation"]).strip().casefold()
         if operation not in {"extract", "import", "retag", "regenerate", "replace", "generate_person"}:
             raise ValueError(f"不支持的参考图任务: {operation}")
-        category_value = ReferenceCategory(category).value if category is not None else ""
+        payload["operation"] = operation
+        request = {
+            key: payload[key]
+            for key in (
+                "operation",
+                "category",
+                "automatic",
+                "origin",
+                "delivery",
+                "asset_id",
+                "batch_id",
+                "request_id",
+                "expected_version",
+                "person_version",
+            )
+            if key in payload
+        }
         task = self._new_task(
             kind=f"reference_{operation}",
             invocation=invocation,
-            prompt_text=name or asset_id or operation,
-            request={
-                "operation": operation,
-                "category": category_value,
-                "automatic": bool(automatic),
-            },
+            prompt_text=str(payload.get("name") or payload.get("asset_id") or operation),
+            request=request,
             parent_task_id=parent_task_id,
         )
-        payload = {
-            "operation": operation,
-            "category": category_value,
-            "name": name.strip() or f"{category_value}-{task.id[:8]}",
-            "asset_id": asset_id.strip(),
-            "manual_tags": dict(manual_tags or {}),
-            "automatic": bool(automatic),
-            "personality": personality.strip(),
-            "nickname": nickname.strip(),
-            "appearance_hint": appearance_hint.strip(),
-            "size": size.strip(),
-        }
+        payload["name"] = payload.get("name") or f"{payload['category']}-{task.id[:8]}"
         try:
             if image is not None:
                 self.payloads.put_upload(task.id, image)
@@ -530,9 +711,10 @@ class PhotoStudioService:
                 task_id=queued.id,
                 kind=queued.kind,
                 operation=operation,
-                category=category_value,
+                category=payload["category"],
                 stream_id=queued.stream_id,
-                automatic=automatic,
+                automatic=bool(payload.get("automatic")),
+                origin=payload["origin"],
                 parent_task_id=parent_task_id,
             )
             return queued
@@ -540,6 +722,108 @@ class PhotoStudioService:
             self.payloads.delete(task.id)
             self.payloads.delete_upload(task.id)
             raise
+
+    def ensure_reference_idle(self, asset_id: str) -> None:
+        """Reject mutations while a queued or selecting job can still use an asset.
+
+        Final role records narrow the guard to actual references. Before they
+        exist, a running selector may already hold continuity/candidate objects
+        across an await; its enabled categories must therefore remain intact.
+        """
+
+        asset = self.gallery.require(asset_id)
+        offset = 0
+        while True:
+            tasks = self.storage.list_tasks(
+                statuses=(TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.GENERATED),
+                limit=10_000,
+                offset=offset,
+            )
+            for task in tasks:
+                if task.request.get("asset_id") == asset_id:
+                    raise ValueError("参考图有未完成的作业，请完成后再修改")
+                references = self.storage.list_task_references(task.id)
+                if any(item.asset_id == asset_id for item in references):
+                    raise ValueError("参考图正在被生图任务使用，请稍后再修改")
+                if task.kind in {"photo", "scene_photo", "image"}:
+                    if {"person", "outfit", "scene"}.issubset({item.role for item in references}):
+                        continue
+                    if task.status == TaskStatus.GENERATED or (
+                        task.result_path is not None and task.result_path.is_file()
+                    ):
+                        continue  # Delivery no longer reads gallery files.
+                    if task.kind != "photo" and asset.category != ReferenceCategory.SCENE:
+                        continue
+                    payload = self._reference_guard_payload(task)
+                    self._guard_photo_reference(task, payload, asset)
+                elif task.kind.startswith("reference_"):
+                    self._guard_reference_target(task, asset)
+            if len(tasks) < 10_000:
+                return
+            offset += len(tasks)
+
+    def _reference_guard_payload(self, task: ImageTask) -> dict[str, Any]:
+        try:
+            return self.payloads.get(task.id)
+        except PhotoStudioError as exc:
+            # Missing/corrupt legacy payloads do not prove an asset is unused.
+            # Only expected payload-validation errors are translated; storage
+            # and programming errors remain visible to the caller.
+            raise ValueError("参考图可能被生图任务使用，载荷无法确认，请先处理未完成的作业") from exc
+
+    def _guard_photo_reference(self, task: ImageTask, payload: Mapping[str, Any], asset: ReferenceAsset) -> None:
+        category = asset.category.value
+        if category != "scene" and task.kind != "photo":
+            return
+        requested = payload.get(f"use_{category}_reference")
+        if requested is not None and not isinstance(requested, bool):
+            raise ValueError("参考图可能被生图任务使用，载荷无效，请先处理未完成的作业")
+        enabled = _optional_bool(requested, getattr(self.config.references, f"{category}_reference_enabled"))
+        if not enabled:
+            return
+        if task.status == TaskStatus.RUNNING:
+            raise ValueError("参考图正在被生图任务使用，选库尚未完成，请稍后再修改")
+        if category == "person":
+            current = self.gallery.get_person()
+            explicit = current.id if current is not None else ""
+        else:
+            explicit = payload.get(f"{category}_id") or ""
+            if not isinstance(explicit, str):
+                raise ValueError("参考图可能被生图任务使用，载荷无效，请先处理未完成的作业")
+        if explicit.strip() == asset.id:
+            raise ValueError("参考图正在被生图任务使用，请稍后再修改")
+
+    def _guard_reference_target(self, task: ImageTask, asset: ReferenceAsset) -> None:
+        operation = str(task.request.get("operation") or task.kind.removeprefix("reference_"))
+        target = task.request.get("asset_id") or ""
+        category = task.request.get("category") or ("person" if operation == "generate_person" else "")
+        person_version = task.request.get("person_version") or ""
+        if (
+            (operation in {"replace", "retag", "regenerate"} and not target)
+            or (operation in {"import", "extract"} and not category)
+            or (category == "person" and task.request.get("origin") == "webui" and not person_version)
+        ):
+            payload = self._reference_guard_payload(task)
+            target = target or payload.get("asset_id") or ""
+            category = category or payload.get("category") or ""
+            person_version = person_version or payload.get("person_version") or ""
+        if not isinstance(target, str) or not isinstance(person_version, str):
+            raise ValueError("参考图有未完成的作业，载荷无效，请先处理后再修改")
+        if target.strip() == asset.id or person_version.partition(":")[0] == asset.id:
+            raise ValueError("参考图有未完成的作业，请完成后再修改")
+        if category == "person" and asset.category == ReferenceCategory.PERSON:
+            # Legacy QQ/startup imports replace the singleton without storing
+            # its ID. WebUI jobs bind it through person_version instead.
+            if task.request.get("origin") != "webui":
+                raise ValueError("参考图有未完成的作业，请完成后再修改")
+            if person_version != "none" and not re.fullmatch(r"[0-9a-f]{32}:.+", person_version):
+                raise ValueError("参考图有未完成的作业，人物版本无法确认，请先处理后再修改")
+        if operation in {"replace", "retag", "regenerate"} and not target:
+            raise ValueError("参考图有未完成的作业，目标无法确认，请先处理后再修改")
+        if operation not in {"replace", "retag", "regenerate", "import", "extract", "generate_person"} or (
+            operation in {"import", "extract"} and category not in {item.value for item in ReferenceCategory}
+        ):
+            raise ValueError("参考图有未完成的作业，目标无法确认，请先处理后再修改")
 
     def get_task_for(
         self,
@@ -610,7 +894,14 @@ class PhotoStudioService:
             raise RecordNotFoundError(f"task not found: {task_id}")
         if task.status not in {TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.SENT}:
             raise StorageError("只有失败、取消或通知未完成的任务可以重试")
-        if task.status == TaskStatus.SENT:
+        if task.kind.startswith("reference_"):
+            if task.status == TaskStatus.SENT or task.result_metadata.get("completed"):
+                raise StorageError("参考图任务已经完成，不能作为通知任务重试")
+            payload = self.payloads.get(task.id)
+            if payload.get("has_upload") and not (self.payloads.upload_root / f"{task.id}.bin").is_file():
+                raise StorageError("任务上传图片已清理，无法重试")
+            task.result_metadata.pop("notification_retry", None)
+        elif task.status == TaskStatus.SENT:
             if task.planner_notified_at is not None:
                 raise StorageError("任务已经完成且 Planner 已收到通知")
             task.result_metadata["notification_retry"] = True
@@ -638,7 +929,10 @@ class PhotoStudioService:
             raise StorageError("任务已经结束")
         task.status = TaskStatus.CANCELLED
         task.error_message = "cancelled by administrator"
-        self.storage.update_task(task)
+        with self.storage.transaction():
+            self.storage.update_task(task)
+            if task.kind.startswith("reference_"):
+                self._complete_reference_receipts(task)
         self.payloads.delete(task.id)
         self.payloads.delete_upload(task.id)
         self.log.info("任务已取消", task_id=task.id, kind=task.kind, stream_id=task.stream_id)
@@ -710,7 +1004,7 @@ class PhotoStudioService:
         self,
         *,
         kind: str,
-        invocation: InvocationContext,
+        invocation: InvocationContext | ReferenceJobContext,
         prompt_text: str,
         request: Mapping[str, Any] | None = None,
         parent_task_id: str | None = None,
@@ -742,6 +1036,22 @@ class PhotoStudioService:
             status=task.status.value,
         )
         try:
+            if task.kind.startswith("reference_"):
+                if task.status == TaskStatus.SENT or task.result_metadata.get("completed"):
+                    task.result_metadata.pop("notification_retry", None)
+                    with self.storage.transaction():
+                        task = self.storage.set_task_status(
+                            task.id,
+                            TaskStatus.SENT,
+                            result_metadata=task.result_metadata,
+                        )
+                        self._complete_reference_receipts(task)
+                    self._cleanup_reference_payload(task.id)
+                    return
+                # Legacy retries could erroneously flag a reference job as a
+                # Planner notification. Reference jobs never use that route.
+                if task.result_metadata.pop("notification_retry", None) is not None:
+                    self.storage.update_task(task)
             if task.kind == "notification_retry" or task.result_metadata.get("notification_retry"):
                 try:
                     await self._notify_success(task)
@@ -771,7 +1081,10 @@ class PhotoStudioService:
             latest = self.storage.get_task(task.id)
             if latest is not None and latest.status != TaskStatus.CANCELLED:
                 error = _safe_error(exc)
-                self.storage.set_task_status(task.id, TaskStatus.FAILED, error_message=error)
+                with self.storage.transaction():
+                    latest = self.storage.set_task_status(task.id, TaskStatus.FAILED, error_message=error)
+                    if task.kind.startswith("reference_"):
+                        self._complete_reference_receipts(latest)
                 self.log.error(
                     "任务处理失败",
                     task_id=task.id,
@@ -1025,12 +1338,26 @@ class PhotoStudioService:
         self.payloads.delete(task.id)
         await self._deliver(self.storage.get_task(task.id) or task)
 
+    @staticmethod
+    def _delivery_allowed(task: ImageTask) -> bool:
+        """Fail closed for non-chat jobs, including recovery and stale retries."""
+
+        return bool(task.stream_id) and not (
+            task.request.get("delivery") == "none"
+            or task.request.get("origin") in {"webui", "startup"}
+            or task.scope_key == "webui:gallery"
+        )
+
     async def _deliver(self, task: ImageTask) -> None:
+        if not self._delivery_allowed(self.storage.get_task(task.id) or task):
+            return
         if task.result_path is None or not task.result_path.is_file():
             raise PhotoStudioError("生成结果文件不存在")
         latest = self.storage.get_task(task.id)
         if latest is not None and latest.status == TaskStatus.CANCELLED:
             self.log.info("取消后的图片不再投递", task_id=task.id, stream_id=task.stream_id)
+            return
+        if latest is not None and not self._delivery_allowed(latest):
             return
         if latest is not None and latest.result_metadata.get("image_sent"):
             if latest.status != TaskStatus.SENT:
@@ -1078,7 +1405,12 @@ class PhotoStudioService:
 
     async def _notify_success(self, task: ImageTask) -> None:
         latest = self.storage.get_task(task.id) or task
-        if latest.planner_notified_at is not None or not self.config.output.notify_planner:
+        if (
+            not self._delivery_allowed(latest)
+            or latest.kind.startswith("reference_")
+            or latest.planner_notified_at is not None
+            or not self.config.output.notify_planner
+        ):
             return
         references = self.storage.list_task_references(task.id)
         delivered_at = latest.sent_at or utc_now()
@@ -1113,7 +1445,7 @@ class PhotoStudioService:
 
     async def _notify_failure(self, task_id: str, error: str) -> None:
         task = self.storage.get_task(task_id)
-        if task is None or not task.stream_id or not self.config.output.notify_planner:
+        if task is None or not self._delivery_allowed(task) or not self.config.output.notify_planner:
             return
         metadata = task.result_metadata
         try:
@@ -1147,10 +1479,15 @@ class PhotoStudioService:
             )
 
     async def _process_reference_task(self, task: ImageTask) -> None:
+        async with self._reference_job_lock:
+            await self._execute_reference_task(task)
+
+    async def _execute_reference_task(self, task: ImageTask) -> None:
         payload = self.payloads.get(task.id)
         operation = str(payload.get("operation") or "")
         category_text = str(payload.get("category") or "")
         category = ReferenceCategory(category_text) if category_text else None
+        self._check_reference_mutation(task, payload)
         self.log.info(
             "开始处理参考图任务",
             task_id=task.id,
@@ -1160,28 +1497,27 @@ class PhotoStudioService:
             automatic=bool(payload.get("automatic")),
         )
 
-        def mark_reference_request_started() -> None:
-            self.storage.mark_task_request_started(task.id)
-            self.log.info(
-                "开始请求参考图生图服务",
-                task_id=task.id,
-                stream_id=task.stream_id,
-                operation=operation,
-                mode=self.config.openai.reference_mode,
-                model=self.config.openai.reference_model,
-            )
+        def check_mutation() -> None:
+            self._check_reference_mutation(task, payload)
 
-        # Import and retag only need the MaiBot tagging model.  Avoid forcing
-        # an OpenAI image provider for already-prepared uploads, so gallery
-        # maintenance remains usable before generation credentials are set.
+        def mark_reference_request_started() -> None:
+            check_mutation()
+            self.storage.mark_task_request_started(task.id)
+
+        # Import and retag only need the MaiBot tagging model. Both paid model
+        # boundaries are persisted, including uploads with tagging but no image
+        # provider, so restart never blindly repeats a billable request.
         service = self._reference_service(
             require_provider=operation in {"extract", "regenerate", "generate_person"},
             before_provider_request=mark_reference_request_started,
+            before_tag_request=mark_reference_request_started,
+            check_mutation=check_mutation,
+            after_persist=lambda asset: self._record_reference_completion(task.id, asset),
         )
         asset: ReferenceAsset
         if operation == "generate_person":
             personality = str(payload.get("personality") or "").strip()
-            if not personality:
+            if not personality and task.request.get("origin") != "webui":
                 personality = await self._host_personality_text()
             if not personality:
                 raise PhotoStudioError("未能读取 MaiBot 人格设定，无法生成人物参考图")
@@ -1199,32 +1535,23 @@ class PhotoStudioService:
             if category is None:
                 raise ValueError("参考图任务缺少 category")
             source = self.payloads.get_upload(task.id)
+            prepared_source = self._prepared_reference_source(task, payload, source)
             old_id = str(payload.get("asset_id") or "")
-            replace_person = category == ReferenceCategory.PERSON
-            if operation == "extract":
-                asset = await service.extract_reference(
-                    category,
-                    source,
-                    name=str(payload.get("name") or ""),
-                    replace_person=replace_person,
-                    manual_tags=_mapping(payload.get("manual_tags")),
-                    source_task_id=task.id,
-                    size=str(payload.get("size") or ""),
-                )
-            else:
-                asset = await service.import_reference(
-                    category,
-                    source,
-                    name=str(payload.get("name") or ""),
-                    replace_person=replace_person,
-                    manual_tags=_mapping(payload.get("manual_tags")),
-                    source_task_id=task.id,
-                )
-            if operation == "replace" and old_id and category != ReferenceCategory.PERSON:
-                old = self.gallery.require(old_id)
-                if old.category != category:
+            if operation == "replace" and old_id:
+                if self.gallery.require(old_id).category != category:
                     raise ValueError("替换参考图分类不一致")
-                self.gallery.soft_delete(old.id)
+            common = {
+                "name": str(payload.get("name") or ""),
+                "replace_person": category == ReferenceCategory.PERSON,
+                "manual_tags": _mapping(payload.get("manual_tags")),
+                "source_task_id": task.id,
+                "prepared_source": prepared_source,
+                "replaces_asset_id": old_id if operation == "replace" and old_id else None,
+            }
+            if operation == "extract":
+                asset = await service.extract_reference(category, source, size=str(payload.get("size") or ""), **common)
+            else:
+                asset = await service.import_reference(category, source, **common)
         elif operation == "retag":
             asset = await service.retag_reference(str(payload.get("asset_id") or ""))
         elif operation == "regenerate":
@@ -1238,26 +1565,14 @@ class PhotoStudioService:
         if bool(payload.get("automatic")):
             try:
                 self._attach_automatic_reference_to_continuity(task, asset)
-            except Exception as exc:  # The extracted asset remains usable even if continuity repair fails.
+            except Exception as exc:  # The asset remains usable even if continuity repair fails.
                 self.log.warning(
                     "自动补库参考图未写入连续性状态",
                     task_id=task.id,
                     asset_id=asset.id,
                     error_kind=_diagnostic_error(exc),
                 )
-        self.storage.set_task_status(
-            task.id,
-            TaskStatus.SENT,
-            result_metadata={
-                "completed": True,
-                "asset_id": asset.id,
-                "asset_category": asset.category.value,
-                "asset_status": asset.status.value,
-                "delivery_required": False,
-            },
-        )
-        self.payloads.delete(task.id)
-        self.payloads.delete_upload(task.id)
+        self._cleanup_reference_payload(task.id)
         self.log.info(
             "参考图任务完成",
             task_id=task.id,
@@ -1266,7 +1581,8 @@ class PhotoStudioService:
             category=asset.category.value,
             asset_status=asset.status.value,
         )
-        if not bool(payload.get("automatic")) and task.stream_id:
+        latest = self.storage.get_task(task.id) or task
+        if not bool(payload.get("automatic")) and self._delivery_allowed(latest):
             try:
                 sent = await self.ctx.send.text(
                     f"参考图任务 {task.id} 已完成：{asset.category.value}/{asset.id}，状态 {asset.status.value}",
@@ -1280,6 +1596,127 @@ class PhotoStudioService:
                     task_id=task.id,
                     error_kind=_diagnostic_error(exc),
                 )
+
+    def _check_reference_mutation(self, task: ImageTask, payload: Mapping[str, Any]) -> None:
+        latest = self.storage.get_task(task.id)
+        if latest is None or latest.status == TaskStatus.CANCELLED:
+            raise PhotoStudioError("参考图任务已取消或不存在")
+        if latest.request.get("origin") != "webui":
+            return
+        operation = str(payload.get("operation") or "")
+        category = str(payload.get("category") or "")
+        if operation in {"replace", "retag", "regenerate"}:
+            expected = str(latest.request.get("expected_version") or "")
+            target = self.gallery.require(str(latest.request.get("asset_id") or ""))
+            if not expected or target.updated_at.isoformat() != expected:
+                raise ReferenceVersionConflictError("参考图已变更，请刷新后重新确认")
+            if target.category.value != category:
+                raise ReferenceVersionConflictError("参考图分类已变更，请刷新后重新确认")
+        if category == ReferenceCategory.PERSON.value:
+            current = self.gallery.get_person()
+            version = f"{current.id}:{current.updated_at.isoformat()}" if current is not None else "none"
+            if not latest.request.get("person_version") or latest.request["person_version"] != version:
+                raise ReferenceVersionConflictError("人物参考图已变更，请刷新后重新确认")
+            if operation == "generate_person" and current is not None:
+                raise PhotoStudioError("已有人物参考图，不能再次从人格生成人物")
+
+    @staticmethod
+    def _prepared_reference_source(
+        task: ImageTask,
+        payload: Mapping[str, Any],
+        data: bytes,
+    ) -> CompressionResult | None:
+        metadata = _mapping(payload.get("source_compression"))
+        if task.request.get("origin") != "webui" or not metadata:
+            return None
+        if metadata.get("sha256") != hashlib.sha256(data).hexdigest() or len(data) > 500_000:
+            raise PhotoStudioError("任务上传图片校验失败")
+        fields = (
+            "sha256",
+            "width",
+            "height",
+            "format",
+            "content_type",
+            "quality",
+            "original_width",
+            "original_height",
+            "original_size",
+            "iterations",
+        )
+        return CompressionResult(data=data, **{key: metadata[key] for key in fields if key in metadata})
+
+    def _record_reference_completion(self, task_id: str, asset: ReferenceAsset) -> None:
+        """Called by ReferenceService inside the gallery's commit transaction."""
+
+        task = self.storage.get_task(task_id)
+        if task is None or task.status == TaskStatus.CANCELLED:
+            raise PhotoStudioError("参考图任务已取消或不存在")
+        task = self.storage.set_task_status(
+            task_id,
+            TaskStatus.SENT,
+            result_metadata={
+                **task.result_metadata,
+                "completed": True,
+                "asset_id": asset.id,
+                "asset_category": asset.category.value,
+                "asset_status": asset.status.value,
+                "duplicate": task.kind != "reference_retag" and asset.source_task_id != task_id,
+                "delivery_required": False,
+            },
+        )
+        self._complete_reference_receipts(task)
+
+    def _complete_reference_receipts(self, task: ImageTask) -> None:
+        if task.status == TaskStatus.SENT:
+            response = {
+                "success": True,
+                "task_id": task.id,
+                "status": "sent",
+                "asset_id": task.result_metadata.get("asset_id", ""),
+                "asset_status": task.result_metadata.get("asset_status", ""),
+                "duplicate": bool(task.result_metadata.get("duplicate")),
+            }
+        elif task.status in {TaskStatus.FAILED, TaskStatus.CANCELLED}:
+            response = {
+                "success": False,
+                "task_id": task.id,
+                "status": task.status.value,
+                "error": (
+                    "任务已取消"
+                    if task.status == TaskStatus.CANCELLED
+                    else "参考图任务失败，请检查日志并重新确认后重试"
+                ),
+            }
+        else:
+            return
+        self.storage.complete_requests_for_task(task.id, response)
+
+    def _reconcile_reference_receipts(self) -> None:
+        offset = 0
+        while True:
+            tasks = self.storage.list_tasks(
+                statuses=(TaskStatus.SENT, TaskStatus.FAILED, TaskStatus.CANCELLED),
+                limit=10_000,
+                offset=offset,
+            )
+            for task in tasks:
+                if task.kind.startswith("reference_"):
+                    with self.storage.transaction():
+                        self._complete_reference_receipts(task)
+                    if task.status == TaskStatus.SENT:
+                        self._cleanup_reference_payload(task.id)
+            if len(tasks) < 10_000:
+                return
+            offset += len(tasks)
+
+    def _cleanup_reference_payload(self, task_id: str) -> None:
+        for delete in (self.payloads.delete, self.payloads.delete_upload):
+            try:
+                delete(task_id)
+            except OSError as exc:
+                # A successful DB commit must not become a failed/retryable
+                # generation because best-effort queue-file cleanup failed.
+                self.log.warning("参考图任务载荷清理失败", task_id=task_id, error_kind=_diagnostic_error(exc))
 
     def _attach_automatic_reference_to_continuity(self, task: ImageTask, asset: ReferenceAsset) -> bool:
         """Associate a completed automatic backfill with its still-current photo."""
@@ -1312,6 +1749,9 @@ class PhotoStudioService:
         *,
         require_provider: bool = True,
         before_provider_request: Callable[[], None] | None = None,
+        before_tag_request: Callable[[], None] | None = None,
+        after_persist: Callable[[ReferenceAsset], None] | None = None,
+        check_mutation: Callable[[], None] | None = None,
     ) -> ReferenceService:
         compression = CompressionConfig(
             target_bytes=min(int(self.config.references.max_bytes), 480_000),
@@ -1332,7 +1772,11 @@ class PhotoStudioService:
             provider=self._provider_instance() if require_provider else self._provider,
             llm=self.llm,
             data_dir=self.data_dir,
+            mutation_lock=self.reference_mutation_lock,
             before_provider_request=before_provider_request,
+            before_tag_request=before_tag_request,
+            after_persist=after_persist,
+            check_mutation=check_mutation,
             config=ReferenceServiceConfig(
                 compression=compression,
                 prompts=prompts,

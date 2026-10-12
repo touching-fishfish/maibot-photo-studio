@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -47,6 +48,28 @@ def _json_load(value: str | None) -> dict[str, Any]:
     return parsed
 
 
+def _validate_request_id(request_id: str) -> None:
+    pattern = r"(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+    if not isinstance(request_id, str) or re.fullmatch(pattern, request_id) is None:
+        raise StorageError("request_id must be 32 lowercase hex characters or a canonical lowercase UUID")
+
+
+def _request_response_json(response: dict[str, Any]) -> str:
+    if not isinstance(response, dict):
+        raise StorageError("request response must be a JSON object")
+    try:
+        return _json_dump(response)
+    except (TypeError, ValueError) as exc:
+        raise StorageError("request response must be JSON serializable") from exc
+
+
+def _validate_pagination(limit: int, offset: int) -> None:
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise ValueError("limit must be an integer between 1 and 100")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError("offset must be a non-negative integer")
+
+
 def _timestamp(value: datetime | None) -> str | None:
     if value is None:
         return None
@@ -71,7 +94,7 @@ class SQLiteStorage:
     `BEGIN IMMEDIATE` transactions, and nested method calls use savepoints.
     """
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(self, database_path: Path | str) -> None:
         self.database_path = Path(database_path)
@@ -86,7 +109,11 @@ class SQLiteStorage:
             timeout=30.0,
         )
         self._connection.row_factory = sqlite3.Row
-        self._initialize()
+        try:
+            self._initialize()
+        except BaseException:
+            self.close()
+            raise
 
     @property
     def connection(self) -> sqlite3.Connection:
@@ -101,12 +128,56 @@ class SQLiteStorage:
 
     def _initialize(self) -> None:
         with self._lock:
+            # Reject newer databases before changing any persistent settings.
+            self._schema_version()
             self._connection.execute("PRAGMA foreign_keys = ON")
             self._connection.execute("PRAGMA busy_timeout = 30000")
             self._connection.execute("PRAGMA synchronous = NORMAL")
             self._connection.execute("PRAGMA journal_mode = WAL")
-            self._connection.executescript(
-                """
+            with self.transaction() as connection:
+                # Re-read under the write lock in case another connection migrated.
+                version = self._schema_version()
+                if version == 0:
+                    self._create_base_schema(connection)
+                    connection.execute("PRAGMA user_version = 1")
+                    version = 1
+                if version == 1:
+                    connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS webui_requests (
+                            request_id TEXT PRIMARY KEY NOT NULL,
+                            parameter_hash TEXT NOT NULL,
+                            operation TEXT NOT NULL,
+                            state TEXT NOT NULL CHECK (
+                                state IN ('preparing', 'accepted', 'completed', 'failed')
+                            ),
+                            task_id TEXT,
+                            response_json TEXT,
+                            created_at TEXT NOT NULL,
+                            updated_at TEXT NOT NULL
+                        )
+                        """
+                    )
+                    # No task FK: a receipt must outlive retained task metadata.
+                    connection.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS ix_webui_request_task
+                            ON webui_requests(task_id) WHERE task_id IS NOT NULL
+                        """
+                    )
+                    connection.execute("PRAGMA user_version = 2")
+
+    def _schema_version(self) -> int:
+        version = self._connection.execute("PRAGMA user_version").fetchone()[0]
+        if version < 0 or version > self.SCHEMA_VERSION:
+            raise StorageError(
+                f"unsupported database schema version {version}; maximum supported is {self.SCHEMA_VERSION}"
+            )
+        return version
+
+    @staticmethod
+    def _create_base_schema(connection: sqlite3.Connection) -> None:
+        schema = """
                 CREATE TABLE IF NOT EXISTS reference_assets (
                     id TEXT PRIMARY KEY,
                     category TEXT NOT NULL CHECK (category IN ('person', 'outfit', 'scene')),
@@ -202,38 +273,40 @@ class SQLiteStorage:
                     FOREIGN KEY(pinned_scene_id) REFERENCES reference_assets(id) ON DELETE SET NULL
                 );
                 """
-            )
-            self._connection.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
+        # executescript implicitly commits; execute each static DDL statement
+        # separately so v0 -> v1 -> v2 is one atomic migration.
+        for statement in schema.split(";"):
+            if statement.strip():
+                connection.execute(statement)
 
     @contextmanager
     def transaction(self, *, immediate: bool = True) -> Iterator[sqlite3.Connection]:
         """Run a transaction, using savepoints for nested storage operations."""
 
-        self._ensure_open()
         with self._lock:
+            self._ensure_open()
             depth = self._transaction_depth
             savepoint = f"maitu_sp_{depth}"
+            if depth == 0:
+                self._connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            else:
+                self._connection.execute(f"SAVEPOINT {savepoint}")
+            self._transaction_depth = depth + 1
             try:
-                if depth == 0:
-                    self._connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
-                else:
-                    self._connection.execute(f"SAVEPOINT {savepoint}")
-                self._transaction_depth += 1
                 yield self._connection
-            except Exception:
-                self._transaction_depth -= 1
+                if depth == 0:
+                    self._connection.commit()
+                else:
+                    self._connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            except BaseException:
                 if depth == 0:
                     self._connection.rollback()
                 else:
                     self._connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                     self._connection.execute(f"RELEASE SAVEPOINT {savepoint}")
                 raise
-            else:
-                self._transaction_depth -= 1
-                if depth == 0:
-                    self._connection.commit()
-                else:
-                    self._connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            finally:
+                self._transaction_depth = depth
 
     def close(self) -> None:
         with self._lock:
@@ -246,6 +319,99 @@ class SQLiteStorage:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+    # WebUI request receipts ------------------------------------------
+
+    def begin_request(self, request_id: str, operation: str, parameter_hash: str) -> dict[str, Any]:
+        """Persist an idempotency receipt, not an authorization or claim token.
+
+        An existing matching request is returned unchanged.  The caller must
+        serialize preparation/submission; this DTO does not elect an owner.
+        """
+
+        _validate_request_id(request_id)
+        if not isinstance(operation, str) or not operation.strip():
+            raise StorageError("operation must be a non-empty string")
+        if not isinstance(parameter_hash, str) or re.fullmatch(r"[0-9a-f]{64}", parameter_hash) is None:
+            raise StorageError("parameter_hash must be a lowercase SHA-256 digest")
+        with self.transaction() as connection:
+            row = connection.execute("SELECT * FROM webui_requests WHERE request_id = ?", (request_id,)).fetchone()
+            if row is not None:
+                if row["operation"] != operation or row["parameter_hash"] != parameter_hash:
+                    raise StorageError("request_id was already used for a different operation or parameters")
+                return self._request_from_row(row)
+            now = _timestamp(utc_now())
+            connection.execute(
+                """
+                INSERT INTO webui_requests (
+                    request_id, parameter_hash, operation, state,
+                    task_id, response_json, created_at, updated_at
+                ) VALUES (?, ?, ?, 'preparing', NULL, NULL, ?, ?)
+                """,
+                (request_id, parameter_hash, operation, now, now),
+            )
+            row = connection.execute("SELECT * FROM webui_requests WHERE request_id = ?", (request_id,)).fetchone()
+            return self._request_from_row(row)
+
+    def get_request(self, request_id: str) -> dict[str, Any] | None:
+        _validate_request_id(request_id)
+        with self._lock:
+            self._ensure_open()
+            row = self._connection.execute(
+                "SELECT * FROM webui_requests WHERE request_id = ?", (request_id,)
+            ).fetchone()
+            return self._request_from_row(row) if row is not None else None
+
+    def update_request(
+        self,
+        request_id: str,
+        *,
+        state: str,
+        response: dict[str, Any] | None = None,
+        task_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Update a receipt; omitted response/task_id preserve their saved values."""
+
+        _validate_request_id(request_id)
+        if state not in ("preparing", "accepted", "completed", "failed"):
+            raise StorageError("invalid request state")
+        response_json = _request_response_json(response) if response is not None else None
+        if task_id is not None and (not isinstance(task_id, str) or not task_id.strip()):
+            raise StorageError("task_id must be a non-empty string or None")
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE webui_requests
+                SET state = ?, response_json = COALESCE(?, response_json),
+                    task_id = COALESCE(?, task_id), updated_at = ?
+                WHERE request_id = ?
+                """,
+                (state, response_json, task_id, _timestamp(utc_now()), request_id),
+            )
+            if cursor.rowcount != 1:
+                raise RecordNotFoundError(f"request not found: {request_id}")
+            row = connection.execute("SELECT * FROM webui_requests WHERE request_id = ?", (request_id,)).fetchone()
+            return self._request_from_row(row)
+
+    def complete_requests_for_task(self, task_id: str, response: dict[str, Any]) -> None:
+        """Finalize pending receipts atomically with a service's task transaction.
+
+        A response with ``success is False`` records failure.  Other responses
+        record completion; terminal receipts are left unchanged on callbacks.
+        """
+
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise StorageError("task_id must be a non-empty string")
+        response_json = _request_response_json(response)
+        state = "failed" if response.get("success") is False else "completed"
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE webui_requests SET state = ?, response_json = ?, updated_at = ?
+                WHERE task_id = ? AND state IN ('preparing', 'accepted')
+                """,
+                (state, response_json, _timestamp(utc_now()), task_id),
+            )
 
     # Reference assets -------------------------------------------------
 
@@ -345,6 +511,80 @@ class SQLiteStorage:
                 values,
             ).fetchall()
         return [self._asset_from_row(row) for row in rows]
+
+    def query_reference_assets(
+        self,
+        category: ReferenceCategory | str | None = None,
+        status: AssetStatus | str | None = None,
+        search: str = "",
+        limit: int = 12,
+        offset: int = 0,
+    ) -> tuple[list[ReferenceAsset], int]:
+        """Return a stable page and its filtered total, excluding deleted by default."""
+
+        _validate_pagination(limit, offset)
+        clauses: list[str] = []
+        values: list[Any] = []
+        if category not in (None, ""):
+            clauses.append("category = ?")
+            values.append(ReferenceCategory(category).value)
+        if status not in (None, ""):
+            status_value = AssetStatus(status).value
+            clauses.append("status = ?")
+            values.append(status_value)
+            if status_value != AssetStatus.DELETED.value:
+                clauses.append("deleted_at IS NULL")
+        else:
+            clauses.extend(("deleted_at IS NULL", "status != 'deleted'"))
+        if not isinstance(search, str):
+            raise ValueError("search must be a string")
+        if search.strip():
+            escaped = search.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%{escaped}%"
+            clauses.append(
+                "(name LIKE ? ESCAPE '\\' OR id LIKE ? ESCAPE '\\' "
+                "OR tags_json LIKE ? ESCAPE '\\' OR manual_tags_json LIKE ? ESCAPE '\\')"
+            )
+            values.extend((pattern, pattern, pattern, pattern))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.transaction(immediate=False) as connection:
+            total = connection.execute("SELECT COUNT(*) FROM reference_assets" + where, values).fetchone()[0]
+            rows = connection.execute(
+                "SELECT * FROM reference_assets" + where + " ORDER BY created_at DESC, id ASC LIMIT ? OFFSET ?",
+                (*values, limit, offset),
+            ).fetchall()
+        return [self._asset_from_row(row) for row in rows], total
+
+    def file_is_referenced(self, path: Path | str, exclude_asset_id: str = "") -> bool:
+        """Protect shared live paths and active reference-job targets, not history.
+
+        ``exclude_asset_id`` excludes that asset's live reference only; an active
+        job targeting it still protects the file.  Paths are compared lexically,
+        without inspecting the filesystem or following symlinks.
+        """
+
+        stored_path = str(Path(path))
+        with self._lock:
+            self._ensure_open()
+            row = self._connection.execute(
+                """
+                SELECT 1 FROM reference_assets AS asset
+                WHERE (asset.source_path = ? OR asset.reference_path = ?)
+                  AND (
+                    (asset.id != ? AND asset.deleted_at IS NULL AND asset.status != 'deleted')
+                    OR EXISTS (
+                        SELECT 1 FROM image_tasks AS task
+                        WHERE task.kind LIKE 'reference\\_%' ESCAPE '\\'
+                          AND task.status IN ('queued', 'running', 'generated')
+                          AND CASE WHEN json_valid(task.request_json)
+                              THEN json_extract(task.request_json, '$.asset_id') END = asset.id
+                    )
+                  )
+                LIMIT 1
+                """,
+                (stored_path, stored_path, exclude_asset_id),
+            ).fetchone()
+        return row is not None
 
     def update_reference_asset(self, asset: ReferenceAsset) -> ReferenceAsset:
         asset.updated_at = utc_now()
@@ -535,6 +775,43 @@ class SQLiteStorage:
             ).fetchall()
         return [self._task_from_row(row) for row in rows]
 
+    def query_reference_tasks(
+        self,
+        origin: str = "",
+        status: TaskStatus | str = "",
+        limit: int = 12,
+        offset: int = 0,
+    ) -> tuple[list[ImageTask], int]:
+        """Query reference jobs, including legacy jobs without an explicit origin."""
+
+        _validate_pagination(limit, offset)
+        clauses = ["kind LIKE 'reference\\_%' ESCAPE '\\'"]
+        values: list[Any] = []
+        if origin:
+            clauses.append(
+                """
+                COALESCE(NULLIF(json_extract(request_json, '$.origin'), ''),
+                    CASE
+                        WHEN json_extract(request_json, '$.automatic') = 1 THEN 'automatic'
+                        WHEN COALESCE(stream_id, '') != '' THEN 'qq'
+                        ELSE 'unknown'
+                    END
+                ) = ?
+                """
+            )
+            values.append(origin)
+        if status:
+            clauses.append("status = ?")
+            values.append(TaskStatus.SENT.value if status == "completed" else TaskStatus(status).value)
+        where = " WHERE " + " AND ".join(clauses)
+        with self.transaction(immediate=False) as connection:
+            total = connection.execute("SELECT COUNT(*) FROM image_tasks" + where, values).fetchone()[0]
+            rows = connection.execute(
+                "SELECT * FROM image_tasks" + where + " ORDER BY created_at DESC, id ASC LIMIT ? OFFSET ?",
+                (*values, limit, offset),
+            ).fetchall()
+        return [self._task_from_row(row) for row in rows], total
+
     def latest_task(self, scope_key: str) -> ImageTask | None:
         tasks = self.list_tasks(scope_key=scope_key, limit=1)
         return tasks[0] if tasks else None
@@ -724,6 +1001,19 @@ class SQLiteStorage:
             return cursor.rowcount == 1
 
     # Row mappers ------------------------------------------------------
+
+    @staticmethod
+    def _request_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "request_id": row["request_id"],
+            "state": row["state"],
+            "operation": row["operation"],
+            "parameter_hash": row["parameter_hash"],
+            "task_id": row["task_id"],
+            "response": _json_load(row["response_json"]) if row["response_json"] is not None else None,
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
 
     @staticmethod
     def _asset_from_row(row: sqlite3.Row | dict[str, Any]) -> ReferenceAsset:

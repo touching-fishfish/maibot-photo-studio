@@ -3,16 +3,17 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 from PIL import Image
 
-from maitu_photo.compression import CompressionConfig
+from maitu_photo.compression import CompressionConfig, CompressionResult, compress_image
 from maitu_photo.gallery import DuplicateReferenceError, ReferenceGallery
-from maitu_photo.models import AssetStatus, ReferenceCategory
-from maitu_photo.provider import GeneratedImage, ProviderImageDecodeError
+from maitu_photo.models import AssetStatus, ImageTask, ReferenceAsset, ReferenceCategory, TaskStatus
+from maitu_photo.provider import GeneratedImage, OpenAICompatibleProvider, ProviderImageDecodeError
 from maitu_photo.reference_service import (
     ReferenceGenerationError,
     ReferencePrompts,
@@ -105,6 +106,11 @@ def _service(
     provider: FakeProvider,
     llm: FakeLLM,
     auto_enable: bool = True,
+    before_provider_request: Callable[[], None] | None = None,
+    before_tag_request: Callable[[], None] | None = None,
+    after_persist: Callable[[ReferenceAsset], None] | None = None,
+    check_mutation: Callable[[], None] | None = None,
+    mutation_lock: asyncio.Lock | None = None,
 ) -> tuple[SQLiteStorage, ReferenceGallery, ReferenceService]:
     storage = SQLiteStorage(tmp_path / "db" / "maitu.sqlite3")
     gallery = ReferenceGallery(storage)
@@ -122,6 +128,11 @@ def _service(
         llm=llm,  # type: ignore[arg-type]
         data_dir=tmp_path / "plugin-data",
         config=config,
+        before_provider_request=before_provider_request,
+        before_tag_request=before_tag_request,
+        after_persist=after_persist,
+        check_mutation=check_mutation,
+        mutation_lock=mutation_lock,
     )
     return storage, gallery, service
 
@@ -308,9 +319,14 @@ def test_person_requires_explicit_replace_and_gallery_deduplicates_imports(
     storage, gallery, service = _service(tmp_path, provider=provider, llm=llm)
     first = _run(service.import_reference("person", _image(), name="first"))
 
+    duplicate_person = _run(service.import_reference("person", _image(), name="second"))
+    assert duplicate_person == first
+    assert len(llm.calls) == 1
+
     with pytest.raises(DuplicateReferenceError) as conflict:
-        _run(service.import_reference("person", _image(), name="second"))
+        _run(service.import_reference("person", _image((2, 3, 4, 255)), name="second"))
     assert conflict.value.existing_id == first.id
+    assert len(llm.calls) == 1
 
     second = _run(
         service.import_reference(
@@ -326,9 +342,9 @@ def test_person_requires_explicit_replace_and_gallery_deduplicates_imports(
 
     source = _image((70, 80, 90, 255))
     outfit = _run(service.import_reference("outfit", source, name="first outfit"))
-    with pytest.raises(DuplicateReferenceError) as duplicate:
-        _run(service.import_reference("outfit", source, name="duplicate outfit"))
-    assert duplicate.value.existing_id == outfit.id
+    duplicate = _run(service.import_reference("outfit", source, name="duplicate outfit"))
+    assert duplicate == outfit
+    assert len(llm.calls) == 3
     assert len(list((tmp_path / "plugin-data" / "sources" / "outfit").glob("*.jpg"))) == 1
     assert len(list((tmp_path / "plugin-data" / "references" / "outfit").glob("*.jpg"))) == 1
     storage.close()
@@ -420,3 +436,521 @@ def test_extraction_error_preserves_safe_provider_category(tmp_path: Path) -> No
 def test_compression_target_above_480000_is_rejected() -> None:
     with pytest.raises(ValueError, match="480000"):
         ReferenceServiceConfig(compression=CompressionConfig(target_bytes=480_001))
+
+
+def test_import_duplicate_returns_original_unchanged_without_models_or_new_files(tmp_path: Path) -> None:
+    provider = FakeProvider()
+    llm = FakeLLM([_tags(ReferenceCategory.OUTFIT)])
+    persisted: list[ReferenceAsset] = []
+    storage, gallery, service = _service(tmp_path, provider=provider, llm=llm, after_persist=persisted.append)
+    source = _image()
+    original = _run(service.import_reference("outfit", source, name="first", source_task_id="first-task"))
+    original = gallery.edit(original.id, manual_tags={"styles": ["manual"]}, selection_metadata={"custom": "keep"})
+    original = gallery.disable(original.id)
+    files_before = {path: path.read_bytes() for path in service.data_dir.rglob("*.jpg")}
+
+    duplicate = _run(
+        service.import_reference(
+            "outfit", source, name="not applied", manual_tags={"invalid": object()}, source_task_id="new-task"
+        )
+    )
+
+    assert duplicate == original
+    assert gallery.require(original.id) == original
+    assert len(llm.calls) == 1 and provider.calls == []
+    assert persisted[-1] == original and len(persisted) == 2
+    assert {path: path.read_bytes() for path in service.data_dir.rglob("*.jpg")} == files_before
+    storage.close()
+
+
+def test_processed_hash_dedup_is_category_specific_and_ignores_deleted_rows(tmp_path: Path) -> None:
+    storage, gallery, service = _service(
+        tmp_path,
+        provider=FakeProvider(),
+        llm=FakeLLM([_tags(ReferenceCategory.OUTFIT), _tags(ReferenceCategory.SCENE)]),
+    )
+    source = _image()
+    outfit = _run(service.import_reference("outfit", source, name="outfit"))
+    scene = _run(service.import_reference("scene", source, name="scene"))
+    assert outfit.sha256 == scene.sha256 and outfit.id != scene.id
+    gallery.soft_delete(outfit.id)
+    service.llm = FakeLLM([_tags(ReferenceCategory.OUTFIT)])  # type: ignore[assignment]
+
+    replacement = _run(service.import_reference("outfit", source, name="re-import"))
+
+    assert replacement.id != outfit.id
+    assert len(service.llm.calls) == 1  # type: ignore[attr-defined]
+    storage.close()
+
+
+@pytest.mark.parametrize("operation", ["import", "extract"])
+def test_prepared_source_skips_first_compression_and_preserves_reference_bytes(tmp_path: Path, operation: str) -> None:
+    storage, _, service = _service(tmp_path, provider=FakeProvider(), llm=FakeLLM([_tags(ReferenceCategory.OUTFIT)]))
+    prepared = compress_image(_image(), config=service.config.compression)
+    expected = compress_image(prepared.data, config=service.config.compression)
+    if operation == "import":
+        asset = _run(
+            service.import_reference("outfit", b"unused invalid source", name="prepared", prepared_source=prepared)
+        )
+        assert asset.reference_path.read_bytes() == expected.data
+    else:
+        asset = _run(
+            service.extract_reference("outfit", b"unused invalid source", name="prepared", prepared_source=prepared)
+        )
+        assert service.provider.calls[0][1]["images"] == [prepared.data]  # type: ignore[union-attr]
+    assert asset.source_path.read_bytes() == prepared.data
+    assert asset.selection_metadata["source_compression"] == prepared.to_dict()
+    storage.close()
+
+
+def test_final_transaction_rechecks_concurrent_duplicate_before_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage, gallery, service = _service(
+        tmp_path, provider=FakeProvider(), llm=FakeLLM([_tags(ReferenceCategory.OUTFIT)])
+    )
+    original_compress = service._compress
+    reference_result: CompressionResult | None = None
+    existing: ReferenceAsset | None = None
+    write_calls: list[Path] = []
+
+    async def track_compress(source: Any) -> CompressionResult:
+        nonlocal reference_result
+        reference_result = await original_compress(source)
+        return reference_result
+
+    class RacingLLM(FakeLLM):
+        async def generate_json(self, prompt: str, **kwargs: Any) -> dict[str, Any]:
+            nonlocal existing
+            assert reference_result is not None
+            existing = gallery.add_reference(
+                category="outfit",
+                name="race winner",
+                source_path=service.data_dir / "sources" / "outfit" / "race.jpg",
+                reference_path=service.data_dir / "references" / "outfit" / "race.jpg",
+                sha256=reference_result.sha256,
+                tags=_tags(ReferenceCategory.OUTFIT),
+                status=AssetStatus.DISABLED,
+            )
+            return await super().generate_json(prompt, **kwargs)
+
+    monkeypatch.setattr(service, "_compress", track_compress)
+    monkeypatch.setattr(service, "_atomic_write", lambda path, data: write_calls.append(path))
+    service.llm = RacingLLM([_tags(ReferenceCategory.OUTFIT)])  # type: ignore[assignment]
+
+    result = _run(service.import_reference("outfit", _image(), name="race loser"))
+
+    assert existing is not None and result == existing
+    assert write_calls == []
+    assert len(gallery.list_assets()) == 1
+    storage.close()
+
+
+def test_shared_mutation_lock_serializes_final_duplicate_commit(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        lock = asyncio.Lock()
+        storage, gallery, service = _service(
+            tmp_path, provider=FakeProvider(), llm=FakeLLM([_tags(ReferenceCategory.OUTFIT)]), mutation_lock=lock
+        )
+        entered = 0
+        release = asyncio.Event()
+        callbacks: list[str] = []
+
+        class WaitingLLM(FakeLLM):
+            async def generate_json(self, prompt: str, **kwargs: Any) -> dict[str, Any]:
+                nonlocal entered
+                entered += 1
+                if entered == 2:
+                    release.set()
+                await release.wait()
+                return await super().generate_json(prompt, **kwargs)
+
+        llm = WaitingLLM([_tags(ReferenceCategory.OUTFIT)])
+
+        def after_persist(asset: ReferenceAsset) -> None:
+            assert lock.locked()
+            assert storage.connection.in_transaction
+            callbacks.append(asset.id)
+
+        services = [
+            service,
+            ReferenceService(
+                gallery=gallery,
+                provider=service.provider,
+                llm=llm,
+                data_dir=service.data_dir,
+                config=service.config,
+                mutation_lock=lock,
+                after_persist=after_persist,
+            ),
+        ]
+        service.llm = llm  # type: ignore[assignment]
+        service._after_persist = after_persist
+        first, second = await asyncio.gather(
+            services[0].import_reference("outfit", _image(), name="first"),
+            services[1].import_reference("outfit", _image(), name="second"),
+        )
+        assert first == second
+        assert len(gallery.list_assets()) == 1
+        assert len(list(service.data_dir.rglob("*.jpg"))) == 2
+        assert callbacks == [first.id, first.id]
+        storage.close()
+
+    _run(scenario())
+
+
+@pytest.mark.parametrize("case", ["same", "other_duplicate"])
+def test_regenerate_duplicate_does_not_retag_mutate_or_delete_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    provider = FakeProvider()
+    llm = FakeLLM([_tags(ReferenceCategory.OUTFIT)])
+    storage, gallery, service = _service(tmp_path, provider=provider, llm=llm)
+    original = _run(service.import_reference("outfit", _image(), name="target", manual_tags={"styles": ["manual"]}))
+    existing = original
+    if case == "other_duplicate":
+        existing = _run(service.import_reference("outfit", _image((7, 8, 9, 255)), name="existing"))
+        existing = gallery.disable(existing.id)
+    persisted: list[ReferenceAsset] = []
+    service._after_persist = persisted.append
+    artifact = compress_image(existing.reference_path, config=service.config.compression)
+    # Force a byte-identical processed provider result, avoiding encoder-version
+    # differences: these tests concern the hash/commit path, not JPEG quality.
+    artifact = CompressionResult(
+        data=existing.reference_path.read_bytes(), sha256=existing.sha256, width=artifact.width, height=artifact.height
+    )
+    original_compress = service._compress
+    compression_calls = 0
+
+    async def regenerated_compress(source: Any) -> CompressionResult:
+        nonlocal compression_calls
+        compression_calls += 1
+        return artifact if compression_calls == 2 else await original_compress(source)
+
+    monkeypatch.setattr(service, "_compress", regenerated_compress)
+    llm_calls_before = len(llm.calls)
+    files_before = {path: path.read_bytes() for path in service.data_dir.rglob("*.jpg")}
+
+    result = _run(service.regenerate_reference(original.id, name="not applied", prompt_version="not applied"))
+
+    assert result == existing
+    assert len(llm.calls) == llm_calls_before
+    assert len(provider.calls) == 1
+    assert gallery.require(original.id) == original
+    assert gallery.require(existing.id) == existing
+    assert persisted == [existing]
+    assert {path: path.read_bytes() for path in service.data_dir.rglob("*.jpg")} == files_before
+    storage.close()
+
+
+@pytest.mark.parametrize("initial_status", [AssetStatus.ACTIVE, AssetStatus.DISABLED, AssetStatus.NEEDS_REVIEW])
+@pytest.mark.parametrize("auto_enable", [True, False])
+def test_retag_valid_preserves_manual_and_explicit_status(
+    tmp_path: Path, initial_status: AssetStatus, auto_enable: bool
+) -> None:
+    llm = FakeLLM([_tags(ReferenceCategory.OUTFIT), {**_tags(ReferenceCategory.OUTFIT), "type": "coat"}])
+    storage, gallery, service = _service(tmp_path, provider=FakeProvider(), llm=llm, auto_enable=auto_enable)
+    asset = _run(service.import_reference("outfit", _image(), name="target", manual_tags={"styles": ["manual"]}))
+    asset = gallery._set_status(asset.id, initial_status)
+    persisted: list[ReferenceAsset] = []
+    service._after_persist = persisted.append
+
+    retagged = _run(service.retag_reference(asset.id))
+
+    expected = initial_status
+    if initial_status == AssetStatus.NEEDS_REVIEW:
+        expected = AssetStatus.ACTIVE if auto_enable else AssetStatus.DISABLED
+    assert retagged.status == expected
+    assert retagged.tags["type"] == "coat"
+    assert retagged.manual_tags == {"styles": ["manual"]}
+    assert retagged.selection_metadata["tag_selectable"] is True
+    assert persisted == [retagged]
+    storage.close()
+
+
+@pytest.mark.parametrize(
+    ("ai_private", "manual_private", "expected_status"),
+    [(True, False, AssetStatus.NEEDS_REVIEW), (False, True, AssetStatus.ACTIVE)],
+)
+def test_new_and_retagged_scene_use_final_effective_tags(
+    tmp_path: Path, ai_private: bool, manual_private: bool, expected_status: AssetStatus
+) -> None:
+    llm = FakeLLM([{**_tags(ReferenceCategory.SCENE), "privacy_eligible": ai_private}])
+    storage, _, service = _service(tmp_path, provider=FakeProvider(), llm=llm)
+    asset = _run(
+        service.import_reference("scene", _image(), name="scene", manual_tags={"privacy_eligible": manual_private})
+    )
+    assert asset.status == expected_status
+    retagged = _run(service.retag_reference(asset.id))
+    assert retagged.status == expected_status
+    assert retagged.tags["privacy_eligible"] is ai_private
+    assert retagged.manual_tags == {"privacy_eligible": manual_private}
+    assert retagged.selection_metadata["tag_selectable"] is (expected_status == AssetStatus.ACTIVE)
+    storage.close()
+
+
+@pytest.mark.parametrize("reply", [RuntimeError("secret"), {"unexpected": "invalid"}])
+def test_retag_failed_ai_keeps_old_ai_and_manual_but_requires_review(tmp_path: Path, reply: Any) -> None:
+    llm = FakeLLM([_tags(ReferenceCategory.PERSON), reply])
+    storage, gallery, service = _service(tmp_path, provider=FakeProvider(), llm=llm)
+    asset = _run(
+        service.import_reference("person", _image(), name="person", manual_tags=_tags(ReferenceCategory.PERSON))
+    )
+
+    result = _run(service.retag_reference(asset.id))
+
+    assert result.tags == asset.tags and result.manual_tags == asset.manual_tags
+    assert result.status == AssetStatus.NEEDS_REVIEW
+    assert gallery.get_person().id == asset.id  # type: ignore[union-attr]
+    storage.close()
+
+
+def test_failed_new_ai_cannot_be_enabled_only_by_complete_manual_tags(tmp_path: Path) -> None:
+    storage, _, service = _service(tmp_path, provider=FakeProvider(), llm=FakeLLM([RuntimeError("failed")]))
+
+    asset = _run(
+        service.import_reference("outfit", _image(), name="review", manual_tags=_tags(ReferenceCategory.OUTFIT))
+    )
+
+    assert asset.tags == {} and asset.status == AssetStatus.NEEDS_REVIEW
+    assert asset.manual_tags == _tags(ReferenceCategory.OUTFIT)
+    storage.close()
+
+
+@pytest.mark.parametrize("auto_enable", [True, False])
+def test_retag_uses_manual_edits_made_while_tag_model_was_running(tmp_path: Path, auto_enable: bool) -> None:
+    storage, gallery, service = _service(
+        tmp_path, provider=FakeProvider(), llm=FakeLLM([_tags(ReferenceCategory.SCENE)]), auto_enable=auto_enable
+    )
+    asset = _run(service.import_reference("scene", _image(), name="scene"))
+
+    class EditingLLM(FakeLLM):
+        async def generate_json(self, prompt: str, **kwargs: Any) -> dict[str, Any]:
+            gallery.edit(asset.id, manual_tags={"privacy_eligible": False})
+            return await super().generate_json(prompt, **kwargs)
+
+    service.llm = EditingLLM([_tags(ReferenceCategory.SCENE)])  # type: ignore[assignment]
+    retagged = _run(service.retag_reference(asset.id))
+
+    assert retagged.manual_tags == {"privacy_eligible": False}
+    assert retagged.status == AssetStatus.NEEDS_REVIEW
+    storage.close()
+
+
+def test_new_review_person_replaces_old_person_only_on_successful_commit(tmp_path: Path) -> None:
+    storage, gallery, service = _service(
+        tmp_path,
+        provider=FakeProvider(),
+        llm=FakeLLM([_tags(ReferenceCategory.PERSON), RuntimeError("tag model failed")]),
+    )
+    original = _run(service.import_reference("person", _image(), name="first"))
+
+    review = _run(service.import_reference("person", _image((9, 7, 5, 255)), name="review", replace_person=True))
+
+    assert review.status == AssetStatus.NEEDS_REVIEW
+    assert gallery.get_person().id == review.id  # type: ignore[union-attr]
+    assert gallery.require(original.id, include_deleted=True).status == AssetStatus.DELETED
+    storage.close()
+
+
+@pytest.mark.parametrize("operation", ["import", "extract"])
+def test_replaces_asset_is_deleted_in_same_transaction_and_duplicate_does_not_delete_target(
+    tmp_path: Path, operation: str
+) -> None:
+    storage, gallery, service = _service(
+        tmp_path, provider=FakeProvider(), llm=FakeLLM([_tags(ReferenceCategory.OUTFIT)])
+    )
+    old = _run(service.import_reference("outfit", _image(), name="old"))
+    other_source = _image((7, 9, 11, 255))
+    existing = _run(service.import_reference("outfit", other_source, name="existing"))
+    callbacks: list[str] = []
+
+    def after_persist(asset: ReferenceAsset) -> None:
+        assert storage.connection.in_transaction
+        if asset.id != existing.id:
+            assert gallery.require(old.id, include_deleted=True).status == AssetStatus.DELETED
+        else:
+            assert gallery.require(old.id) == old
+        callbacks.append(asset.id)
+
+    service._after_persist = after_persist
+    duplicate = _run(service.import_reference("outfit", other_source, name="duplicate", replaces_asset_id=old.id))
+    assert duplicate == existing and gallery.require(old.id) == old
+    if operation == "import":
+        result = _run(
+            service.import_reference("outfit", _image((31, 41, 51, 255)), name="new", replaces_asset_id=old.id)
+        )
+    else:
+        result = _run(
+            service.extract_reference("outfit", _image((31, 41, 51, 255)), name="new", replaces_asset_id=old.id)
+        )
+    assert callbacks == [existing.id, result.id]
+    assert gallery.require(old.id, include_deleted=True).status == AssetStatus.DELETED
+    storage.close()
+
+
+@pytest.mark.parametrize("cancel_at", ["before_ai", "before_commit"])
+def test_check_mutation_cancellation_prevents_paid_request_or_commit(tmp_path: Path, cancel_at: str) -> None:
+    provider = FakeProvider()
+    llm = FakeLLM([_tags(ReferenceCategory.OUTFIT)])
+    tag_calls: list[str] = []
+    checks = 0
+    cancelled = False
+
+    def check_mutation() -> None:
+        nonlocal checks
+        checks += 1
+        if cancelled and (cancel_at == "before_ai" or checks == 3):
+            raise asyncio.CancelledError
+
+    storage, gallery, service = _service(
+        tmp_path,
+        provider=provider,
+        llm=llm,
+        check_mutation=check_mutation,
+        before_tag_request=lambda: tag_calls.append("paid"),
+    )
+    original = _run(service.import_reference("person", _image(), name="keep"))
+    checks = 0
+    cancelled = True
+    with pytest.raises(asyncio.CancelledError):
+        _run(service.import_reference("person", _image((1, 5, 9, 255)), name="cancelled", replace_person=True))
+
+    assert gallery.get_person() == original
+    assert len(list(service.data_dir.rglob("*.jpg"))) == 2
+    assert not storage.connection.in_transaction
+    expected_calls = 1 if cancel_at == "before_ai" else 2
+    assert len(llm.calls) == expected_calls and len(tag_calls) == expected_calls
+    assert provider.calls == []
+    storage.close()
+
+
+def test_provider_and_tag_hooks_follow_cancellation_checks(tmp_path: Path) -> None:
+    events: list[str] = []
+    storage, _, service = _service(
+        tmp_path,
+        provider=FakeProvider(),
+        llm=FakeLLM([_tags(ReferenceCategory.OUTFIT)]),
+        check_mutation=lambda: events.append("check"),
+        before_provider_request=lambda: events.append("provider_paid"),
+        before_tag_request=lambda: events.append("tag_paid"),
+        after_persist=lambda asset: events.append("persisted"),
+    )
+
+    _run(service.extract_reference("outfit", _image(), name="hooks"))
+
+    assert events == ["check", "provider_paid", "check", "check", "tag_paid", "check", "persisted"]
+    storage.close()
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+def test_after_persist_failure_rolls_back_person_replacement_and_removes_new_artifacts(
+    tmp_path: Path, failure: type[BaseException]
+) -> None:
+    storage, gallery, service = _service(
+        tmp_path, provider=FakeProvider(), llm=FakeLLM([_tags(ReferenceCategory.PERSON)])
+    )
+    old = _run(service.import_reference("person", _image(), name="keep"))
+    task = storage.create_task(ImageTask(kind="reference", scope_key="test"))
+    existing_files = set(service.data_dir.rglob("*.jpg"))
+
+    def fail_completion(asset: ReferenceAsset) -> None:
+        storage.set_task_status(task.id, TaskStatus.SENT)
+        raise failure("completion failed")
+
+    service._after_persist = fail_completion
+    with pytest.raises(failure):
+        _run(service.import_reference("person", _image((2, 4, 6, 255)), name="replace", replace_person=True))
+
+    assert gallery.get_person() == old
+    assert set(service.data_dir.rglob("*.jpg")) == existing_files
+    assert storage.get_task(task.id).status == TaskStatus.QUEUED  # type: ignore[union-attr]
+    assert not storage.connection.in_transaction
+    storage.close()
+
+
+def test_retag_completion_failure_rolls_back_tags_status_and_task(tmp_path: Path) -> None:
+    storage, gallery, service = _service(
+        tmp_path,
+        provider=FakeProvider(),
+        llm=FakeLLM([_tags(ReferenceCategory.OUTFIT), {**_tags(ReferenceCategory.OUTFIT), "type": "coat"}]),
+    )
+    original = _run(service.import_reference("outfit", _image(), name="keep"))
+    task = storage.create_task(ImageTask(kind="reference", scope_key="test"))
+
+    def fail_completion(asset: ReferenceAsset) -> None:
+        storage.set_task_status(task.id, TaskStatus.SENT)
+        raise RuntimeError("completion failed")
+
+    service._after_persist = fail_completion
+    with pytest.raises(RuntimeError, match="completion failed"):
+        _run(service.retag_reference(original.id))
+
+    assert gallery.require(original.id) == original
+    assert storage.get_task(task.id).status == TaskStatus.QUEUED  # type: ignore[union-attr]
+    storage.close()
+
+
+def test_write_failure_after_atomic_replace_leaves_no_new_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage, gallery, service = _service(
+        tmp_path, provider=FakeProvider(), llm=FakeLLM([_tags(ReferenceCategory.PERSON)])
+    )
+    old = _run(service.import_reference("person", _image(), name="keep"))
+    existing_files = set(service.data_dir.rglob("*.jpg"))
+    atomic_write = service._atomic_write
+
+    def fail_write(path: Path, data: bytes) -> None:
+        atomic_write(path, data)
+        raise OSError("disk unavailable after replace")
+
+    monkeypatch.setattr(service, "_atomic_write", fail_write)
+    with pytest.raises(OSError):
+        _run(service.import_reference("person", _image((4, 8, 12, 255)), name="replace", replace_person=True))
+
+    assert gallery.get_person() == old
+    assert set(service.data_dir.rglob("*.jpg")) == existing_files
+    storage.close()
+
+
+def test_retry_limit_is_only_passed_to_openai_compatible_provider(tmp_path: Path) -> None:
+    class RecordingCompatibleProvider(OpenAICompatibleProvider):
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def generate(self, prompt: str, **kwargs: Any) -> GeneratedImage:
+            self.calls.append(kwargs)
+            return GeneratedImage(data=_image((20, 150, 90, 255)), media_type="image/png")
+
+    provider = RecordingCompatibleProvider()
+    storage, _, service = _service(
+        tmp_path,
+        provider=provider,
+        llm=FakeLLM([_tags(ReferenceCategory.OUTFIT)]),  # type: ignore[arg-type]
+    )
+    _run(service.extract_reference("outfit", _image(), name="no retry"))
+    assert provider.calls[0]["retry_limit"] == 0
+    fake = FakeProvider()
+    service.provider = fake  # type: ignore[assignment]
+    _run(service.extract_reference("scene", _image(), name="fake"))
+    assert "retry_limit" not in fake.calls[0][1]
+    storage.close()
+
+
+def test_personality_generation_keeps_low_level_explicit_replace_contract(tmp_path: Path) -> None:
+    storage, gallery, service = _service(
+        tmp_path, provider=FakeProvider(), llm=FakeLLM([_tags(ReferenceCategory.PERSON)])
+    )
+    old = _run(service.import_reference("person", _image(), name="old"))
+    with pytest.raises(DuplicateReferenceError):
+        _run(service.generate_person_from_personality(name="new", personality="short hair"))
+    assert service.provider.calls == []  # type: ignore[union-attr]
+
+    generated = _run(
+        service.generate_person_from_personality(name="new", personality="short hair", replace_person=True)
+    )
+
+    assert gallery.get_person().id == generated.id  # type: ignore[union-attr]
+    assert gallery.require(old.id, include_deleted=True).status == AssetStatus.DELETED
+    storage.close()

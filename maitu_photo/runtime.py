@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import binascii
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 from .continuity import make_scope_key
@@ -50,6 +50,21 @@ class InvocationContext:
                 # Older hosts did not include platform in tool context.
                 return True
         return False
+
+
+@dataclass(frozen=True, slots=True)
+class ReferenceJobContext:
+    """Server-created gallery context, deliberately unrelated to a chat caller."""
+
+    stream_id: str = field(default="", init=False)
+    scope_key: str = field(default="webui:gallery", init=False)
+    user_id: str = field(default="", init=False)
+    group_id: str | None = field(default=None, init=False)
+    message_id: str = field(default="", init=False)
+    message: Mapping[str, Any] = field(default_factory=dict, init=False)
+    platform: str = field(default="webui", init=False)
+    origin: str = field(default="webui", init=False)
+    delivery: str = field(default="none", init=False)
 
 
 def invocation_context(kwargs: Mapping[str, Any]) -> InvocationContext:
@@ -306,6 +321,7 @@ __all__ = [
     "ImageInputError",
     "InvocationContext",
     "InvocationError",
+    "ReferenceJobContext",
     "extract_message_images",
     "invocation_context",
     "resolve_single_image",

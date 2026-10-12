@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>麦麦写真 · 参考图库</title><style>@@STYLE@@</style></head>
+<body>
+<main class="app">
+  <header class="page-heading">
+    <div><h1>参考图库</h1><p class="muted">管理人物、服装与场景参考素材。原有 QQ 命令保留；网页不会自动发起模型请求。</p></div>
+    <nav class="nav" aria-label="工作区页面"><button type="button" aria-current="page" disabled>参考图库</button><button id="nav-tasks" type="button" data-navigation>管理任务</button></nav>
+  </header>
+  <div id="notice" class="note notice" hidden><span id="notice-text"></span><button id="notice-close" type="button" aria-label="关闭提示">关闭</button></div>
+  <p id="busy-label" class="busy-label" role="status" aria-live="polite">等待宿主连接…</p>
+  <section class="panel" aria-label="筛选与工具栏">
+    <div class="filters">
+      <div class="field"><label for="category-filter">素材类别</label><select id="category-filter"><option value="">全部类别</option><option value="person">人物</option><option value="outfit">服装</option><option value="scene">场景</option></select></div>
+      <div class="field"><label for="status-filter">素材状态</label><select id="status-filter"><option value="">全部状态</option><option value="active">已启用</option><option value="disabled">已停用</option><option value="needs_review">待审核</option></select></div>
+      <div class="field grow"><label for="search-filter">搜索名称或标签</label><input id="search-filter" type="search" maxlength="4000" placeholder="输入名称或标签"></div>
+      <div class="field"><label for="page-size">每页数量</label><select id="page-size"><option value="12">12 张</option><option value="24">24 张</option></select></div>
+      <button id="apply-filters" type="button">应用筛选</button><button id="refresh-gallery" type="button">刷新</button>
+    </div>
+    <div class="selection-bar">
+      <label class="check-label"><input id="select-page" type="checkbox">选择本页</label><span id="selection-count" class="selection-count help">未选择素材</span>
+      <button id="clear-selection" type="button">清除选择</button>
+      <button id="enable-selected" type="button" data-mutate>启用</button><button id="disable-selected" type="button" data-mutate>停用</button>
+      <button id="retag-selected" type="button" data-mutate>重新标注</button><button id="regenerate-selected" type="button" data-mutate>重新生成参考板</button>
+      <button id="delete-selected" type="button" class="danger" data-mutate>删除</button>
+    </div>
+    <div class="toolbar" style="margin-top:12px"><button id="open-upload" type="button" class="primary" data-mutate>上传图片</button><button id="open-person" type="button" data-mutate>生成人物参考板</button><span id="settings-note" class="help">正在读取配置…</span></div>
+    <p class="help" style="margin-top:10px">导入、替换及重新标注在提交时可能产生视觉模型（VLM）费用。生成类操作、删除与人物导入／覆盖会再次确认，待审的新人物也会替换旧人物。每批最多 20 张，人物仅允许单张。</p>
+  </section>
+  <section aria-label="素材图片网格"><div id="gallery-grid" class="gallery-grid" aria-busy="true"></div><div id="gallery-empty" class="empty" hidden>没有符合筛选条件的素材。</div></section>
+  <div class="pagination"><button id="previous-page" type="button">上一页</button><span id="page-label" class="help">正在加载…</span><button id="next-page" type="button">下一页</button></div>
+  <details id="receipts-panel" class="panel"><summary>请求回执 <span id="receipt-count"></span></summary><p class="help">操作超时不等于失败。这里只查询原请求，不会再次提交或计费。跨页可携带未确定的请求号；刷新前请记下请求号。</p><div class="row" style="margin:10px 0"><label for="receipt-input">按请求号找回</label><input id="receipt-input" class="mono" maxlength="128" placeholder="粘贴原请求号"><button id="receipt-lookup" type="button">查询回执</button></div><div id="receipt-list"></div></details>
+</main>
+<dialog id="asset-dialog" aria-labelledby="asset-dialog-title">
+  <div class="dialog-header"><h2 id="asset-dialog-title">素材详情</h2><button id="asset-close" type="button">关闭</button></div>
+  <div class="dialog-body">
+    <p id="asset-info" class="help"></p><p id="asset-validation" class="note error" hidden></p>
+    <div class="row"><button id="preview-source" type="button" data-mutate>按需预览来源图</button><button id="preview-reference" type="button" data-mutate>按需预览参考板</button><span id="preview-status" class="help">预览按需准备；不会下载完整原图。</span></div>
+    <div id="asset-preview-area" class="preview-area" hidden><img id="asset-preview" alt="素材按需预览" hidden></div>
+    <div class="field"><label for="asset-name">素材名称</label><input id="asset-name" maxlength="200"></div>
+    <h3>标签对照</h3>
+    <table class="tag-columns"><thead><tr><th scope="col">AI 标签（只读）</th><th scope="col">人工覆盖（当前编辑）</th><th scope="col">最终生效标签</th></tr></thead><tbody><tr><td data-label="AI 标签（只读）"><pre id="ai-tags"></pre></td><td data-label="人工覆盖（当前编辑）"><pre id="manual-tags"></pre></td><td data-label="最终生效标签"><pre id="effective-tags"></pre></td></tr></tbody></table>
+    <h3>编辑人工覆盖</h3><p class="help">勾选字段才覆盖 AI 值；取消勾选即恢复该字段的 AI 值。数组用逗号分隔，置信度为 0～1。表单和高级 JSON 双向同步。</p>
+    <div id="tag-fields" class="form-grid"></div>
+    <div class="row"><button id="clear-overrides" type="button" data-mutate>撤销全部人工覆盖</button><span class="help">此按钮只修改草稿；点击「保存名称与标签」后才生效。</span></div>
+    <details><summary>高级 JSON（人工覆盖对象）</summary><label class="help" for="manual-json">仅接受此类别已有标签字段；空对象表示不覆盖任何 AI 标签。</label><textarea id="manual-json" rows="7" class="mono" spellcheck="false"></textarea><p id="tag-json-error" class="task-error" role="alert" hidden></p></details>
+    <p id="asset-edit-note" class="help">保存使用素材更新时间校验；发生并发修改时请关闭详情并刷新，不会自动覆盖。</p>
+  </div>
+  <div class="dialog-footer"><button id="replace-asset" type="button" data-mutate>替换参考图</button><button id="asset-retag" type="button" data-mutate>重新标注（VLM）</button><button id="asset-regenerate" type="button" data-mutate>重新生成参考板</button><button id="save-asset" type="button" class="primary" data-mutate>保存名称与标签</button></div>
+</dialog>
+<dialog id="upload-dialog" aria-labelledby="upload-title">
+  <div class="dialog-header"><h2 id="upload-title">上传图片</h2><button id="upload-close" type="button">关闭</button></div>
+  <div class="dialog-body">
+    <p class="note">第一步只上传并暂存，不调用模型；第二步提交才会处理图片。请先编辑名称。JPEG、PNG、WebP，每张源文件最多 64 MiB，宿主将上传副本最长边缩到 2048 像素。</p>
+    <div class="form-grid"><div class="field"><label for="upload-category">目标类别</label><select id="upload-category"><option value="outfit">服装</option><option value="scene">场景</option><option value="person">人物（单张）</option></select></div><div class="field"><label for="upload-operation">处理方式</label><select id="upload-operation"><option value="import">导入已有参考图</option><option value="extract">提取并生成参考板</option><option value="replace" hidden>替换已有参考图</option></select></div></div>
+    <p id="upload-risk" class="note"></p>
+    <div class="field"><label for="upload-files">选择图片（最多 20 张；人物单张）</label><input id="upload-files" type="file" accept="image/jpeg,image/png,image/webp" multiple></div>
+    <div id="upload-list" class="file-list"></div><p id="upload-progress" class="help" role="status" aria-live="polite">尚未选择图片。</p>
+  </div>
+  <div class="dialog-footer"><button id="upload-stop" type="button" hidden>停止后续操作</button><button id="stage-files" type="button" data-mutate>仅上传并暂存</button><button id="submit-files" type="button" class="primary" data-mutate>暂存后提交</button></div>
+</dialog>
+<dialog id="person-dialog" class="small" aria-labelledby="person-title">
+  <div class="dialog-header"><h2 id="person-title">生成人物参考板</h2><button id="person-close" type="button">关闭</button></div>
+  <div class="dialog-body"><p class="note">按 MaiBot 宿主人格生成人物参考板，会调用图像生成模型并可能计费。仅当前没有人物参考时可生成；如需替换已有人物，请使用上传替换，或先在图库中二次确认删除。</p><div class="field"><label for="person-name">名称</label><input id="person-name" maxlength="200" value="人物参考"></div><div class="field"><label for="appearance-hint">补充外貌提示（可选）</label><textarea id="appearance-hint" maxlength="4000" placeholder="可补充面部、发型、肤色和年龄感；留空按宿主人格生成"></textarea></div><p id="person-version-note" class="help"></p></div>
+  <div class="dialog-footer"><button id="generate-person" type="button" class="primary" data-mutate>继续，确认生成费用与覆盖</button></div>
+</dialog>
+<dialog id="result-dialog" class="small" aria-labelledby="result-title"><div class="dialog-header"><h2 id="result-title">批量操作结果</h2><button id="result-close" type="button">关闭</button></div><div class="dialog-body"><p id="result-summary" class="note"></p><div id="result-items"></div><p class="help">失败条目不会自动重新提交。关闭此窗口后，请刷新并检查版本再决定下一步。</p></div></dialog>
+<dialog id="confirm-dialog" class="small" aria-labelledby="confirm-title"><div class="dialog-header"><h2 id="confirm-title">确认操作</h2></div><div class="dialog-body"><p id="confirm-description" class="note"></p><pre id="confirm-summary"></pre></div><div class="dialog-footer"><button id="confirm-cancel" type="button">取消</button><button id="confirm-approve" type="button" class="primary">确认提交</button></div></dialog>
+<script>@@COMMON_JS@@</script><script>@@PAGE_JS@@</script>
+</body></html>

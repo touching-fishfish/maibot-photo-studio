@@ -917,6 +917,53 @@ def test_provider_retries_retryable_generation_failures(caplog: pytest.LogCaptur
     assert "HTTP状态=503" in caplog.text
 
 
+def test_reference_retry_override_does_not_change_normal_generation() -> None:
+    attempts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request.url.path)
+        return httpx.Response(503, text="temporarily unavailable", request=request)
+
+    async def scenario() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            provider = OpenAICompatibleProvider(
+                "https://api.example.test",
+                "test-key-value",
+                generation_model="image-model",
+                extraction_model="reference-model",
+                max_retries=2,
+                retry_backoff_seconds=0,
+                client=client,
+            )
+            with pytest.raises(ProviderHTTPError):
+                await provider.generate("reference", extraction=True, retry_limit=0)
+            assert len(attempts) == 1
+            with pytest.raises(ProviderHTTPError):
+                await provider.generate("photo")
+            assert len(attempts) == 4
+            assert provider.max_retries == 2
+
+    _run(scenario())
+
+
+@pytest.mark.parametrize("retry_limit", [-1, 3, True, 0.5])
+def test_provider_rejects_invalid_per_call_retry_limit(retry_limit: int) -> None:
+    async def scenario() -> None:
+        provider = OpenAICompatibleProvider(
+            "https://api.example.test",
+            "test-key-value",
+            generation_model="image-model",
+            max_retries=2,
+        )
+        try:
+            with pytest.raises(ProviderConfigError, match="retry_limit"):
+                await provider.generate("reference", retry_limit=retry_limit)
+        finally:
+            await provider.aclose()
+
+    _run(scenario())
+
+
 def test_provider_retry_reuses_binary_stream_references() -> None:
     result_image = _png("green")
     reference_image = _png("blue")

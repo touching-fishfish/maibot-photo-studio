@@ -38,6 +38,10 @@ class ReferenceNotSelectableError(GalleryError):
     pass
 
 
+class ReferenceVersionConflictError(GalleryError):
+    """The asset changed since the caller read its ``updated_at`` version."""
+
+
 def file_sha256(path: Path | str, *, chunk_size: int = 1024 * 1024) -> str:
     """Hash a processed reference without loading the whole file into memory."""
 

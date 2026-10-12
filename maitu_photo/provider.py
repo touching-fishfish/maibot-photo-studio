@@ -904,6 +904,7 @@ class OpenAICompatibleProvider:
         response_format: str | None = None,
         extra: Mapping[str, Any] | None = None,
         extraction: bool = False,
+        retry_limit: int | None = None,
     ) -> list[GeneratedImage]:
         """Generate one or more images using exactly the selected mode."""
 
@@ -921,8 +922,11 @@ class OpenAICompatibleProvider:
         # File-like inputs are consumable.  Freeze all inputs before the retry
         # loop so a retry sends the same reference images as the first request.
         materialized_refs = _materialize_image_inputs(refs)
+        retries = self.max_retries if retry_limit is None else retry_limit
+        if not isinstance(retries, int) or isinstance(retries, bool) or not 0 <= retries <= self.max_retries:
+            raise ProviderConfigError("retry_limit must be between 0 and configured max_retries")
 
-        for attempt in range(self.max_retries + 1):
+        for attempt in range(retries + 1):
             try:
                 if selected_mode in {"images_api", "images_json"}:
                     if materialized_refs:
@@ -965,7 +969,7 @@ class OpenAICompatibleProvider:
                     )
                 return await self._parse_response(response)
             except ProviderError as exc:
-                if not exc.retryable or attempt >= self.max_retries:
+                if not exc.retryable or attempt >= retries:
                     raise
                 retry_number = attempt + 1
                 delay = min(

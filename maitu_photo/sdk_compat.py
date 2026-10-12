@@ -7,7 +7,7 @@ from enum import Enum
 from typing import Any, Callable
 
 try:  # pragma: no cover - exercised by MaiBot and SDK integration tests
-    from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, Command, MaiBotPlugin, Tool
+    from maibot_sdk import API, CONFIG_RELOAD_SCOPE_SELF, Command, MaiBotPlugin, Tool
     from maibot_sdk.types import ToolParameterInfo as _ToolParameterInfo
     from maibot_sdk.types import ToolParamType
 
@@ -80,6 +80,16 @@ except ImportError:  # pragma: no cover - local tests use this lightweight surfa
             aliases=list(aliases or []),
             **metadata,
         )
+
+    def API(
+        name: str,
+        *,
+        version: str = "1",
+        public: bool = False,
+        description: str = "",
+        **metadata: Any,
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        return _component("api", name, version=version, public=public, description=description, **metadata)
 
     class MaiBotPlugin:
         config_model: type[Any] | None = None
@@ -154,6 +164,7 @@ def ToolParameterInfo(
 
 
 __all__ = [
+    "API",
     "CONFIG_RELOAD_SCOPE_SELF",
     "Command",
     "MaiBotPlugin",

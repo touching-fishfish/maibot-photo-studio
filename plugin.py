@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import re
@@ -19,9 +20,9 @@ if __package__:
         parse_tags,
     )
     from .maitu_photo.config import PhotoPluginConfig, ToolDescriptionSection
+    from .maitu_photo.gallery_management import GalleryManagement
     from .maitu_photo.logging_utils import diagnostic_error, redact_text
     from .maitu_photo.models import AssetStatus, ReferenceAsset, ReferenceCategory, TaskStatus
-    from .maitu_photo.reference_service import validate_reference_tags
     from .maitu_photo.runtime import (
         InvocationContext,
         InvocationError,
@@ -29,6 +30,7 @@ if __package__:
         resolve_single_image,
     )
     from .maitu_photo.sdk_compat import (
+        API,
         CONFIG_RELOAD_SCOPE_SELF,
         Command,
         MaiBotPlugin,
@@ -37,6 +39,7 @@ if __package__:
         ToolParamType,
     )
     from .maitu_photo.service import PhotoStudioService
+    from .maitu_photo.webui_api import PhotoWebUI
 else:  # direct local import used by unit tests
     from maitu_photo.commands import (
         AdminCommand,
@@ -46,9 +49,9 @@ else:  # direct local import used by unit tests
         parse_tags,
     )
     from maitu_photo.config import PhotoPluginConfig, ToolDescriptionSection
+    from maitu_photo.gallery_management import GalleryManagement
     from maitu_photo.logging_utils import diagnostic_error, redact_text
     from maitu_photo.models import AssetStatus, ReferenceAsset, ReferenceCategory, TaskStatus
-    from maitu_photo.reference_service import validate_reference_tags
     from maitu_photo.runtime import (
         InvocationContext,
         InvocationError,
@@ -56,6 +59,7 @@ else:  # direct local import used by unit tests
         resolve_single_image,
     )
     from maitu_photo.sdk_compat import (
+        API,
         CONFIG_RELOAD_SCOPE_SELF,
         Command,
         MaiBotPlugin,
@@ -64,6 +68,7 @@ else:  # direct local import used by unit tests
         ToolParamType,
     )
     from maitu_photo.service import PhotoStudioService
+    from maitu_photo.webui_api import PhotoWebUI
 
 
 PLUGIN_ID = "maitu.photo-studio"
@@ -132,18 +137,23 @@ class MaiTuPhotoPlugin(MaiBotPlugin):
     def __init__(self) -> None:
         super().__init__()
         self._service: PhotoStudioService | None = None
+        self._webui: PhotoWebUI | None = None
+        self._webui_lock = asyncio.Lock()
         self._confirmations: dict[str, tuple[float, str, str, str]] = {}
 
     async def on_load(self) -> None:
         data_dir = Path(self.ctx.paths.data_dir)
         self._service = PhotoStudioService(self.ctx, self.config, data_dir)
         await self._service.start()
+        self._webui = PhotoWebUI(self._service, self.ctx)
         self._service.log.info("插件已加载", data_dir=data_dir)
 
     async def on_unload(self) -> None:
-        if self._service is not None:
-            await self._service.close()
-            self._service = None
+        async with self._webui_lock:
+            self._webui = None
+            if self._service is not None:
+                await self._service.close()
+                self._service = None
 
     async def on_config_update(
         self,
@@ -154,11 +164,14 @@ class MaiTuPhotoPlugin(MaiBotPlugin):
         del config_data
         if scope != CONFIG_RELOAD_SCOPE_SELF:
             return
-        if self._service is not None:
-            await self._service.close()
-        self._service = PhotoStudioService(self.ctx, self.config, self.ctx.paths.data_dir)
-        await self._service.start()
-        self._service.log.info("插件运行配置已热更新", version=version, reload_scope=scope)
+        async with self._webui_lock:
+            self._webui = None
+            if self._service is not None:
+                await self._service.close()
+            self._service = PhotoStudioService(self.ctx, self.config, self.ctx.paths.data_dir)
+            await self._service.start()
+            self._webui = PhotoWebUI(self._service, self.ctx)
+            self._service.log.info("插件运行配置已热更新", version=version, reload_scope=scope)
 
     def get_components(self) -> list[dict[str, Any]]:
         """Inject configurable Tool text and command prefix at registration."""
@@ -510,6 +523,43 @@ class MaiTuPhotoPlugin(MaiBotPlugin):
         except Exception as exc:
             return self._tool_error(exc)
 
+    @API("webui_gallery_query", version="1", public=False, description="网页参考图库只读查询")
+    async def webui_gallery_query(self, operation: str = "list", args: dict[str, Any] | None = None) -> dict[str, Any]:
+        return await self._webui_call("gallery_query", operation=operation, args=args)
+
+    @API("webui_task_query", version="1", public=False, description="网页参考作业与请求回执查询")
+    async def webui_task_query(self, operation: str = "list", args: dict[str, Any] | None = None) -> dict[str, Any]:
+        return await self._webui_call("task_query", operation=operation, args=args)
+
+    @API("webui_gallery_action", version="1", public=False, description="网页参考图库显式管理操作")
+    async def webui_gallery_action(
+        self,
+        operation: str,
+        request_id: str,
+        args: dict[str, Any],
+        confirm_token: str = "",
+    ) -> dict[str, Any]:
+        return await self._webui_call(
+            "action", operation=operation, request_id=request_id, args=args, confirm_token=confirm_token
+        )
+
+    @API("webui_stage_upload", version="1", public=False, description="领取上传并暂存规范化图片，不调用模型")
+    async def webui_stage_upload(self, upload_id: str, request_id: str) -> dict[str, Any]:
+        return await self._webui_call("stage_upload", upload_id=upload_id, request_id=request_id)
+
+    async def _webui_call(self, method: str, **kwargs: Any) -> dict[str, Any]:
+        async with self._webui_lock:
+            try:
+                webui = self._webui
+                if webui is None or webui.service is not self._service:
+                    raise ValueError("插件正在重载，请稍后刷新")
+                if method in {"action", "stage_upload"}:
+                    self._require_enabled()
+                return await getattr(webui, method)(**kwargs)
+            except Exception as exc:
+                self._log_failure("网页接口调用失败", exc, api=method)
+                return {"success": False, "error": PhotoWebUI._error(exc)}
+
     @Command(
         "maitu_admin",
         description="麦麦写真插件管理员命令",
@@ -580,7 +630,8 @@ class MaiTuPhotoPlugin(MaiBotPlugin):
             )
             return {"success": True, "task_id": task.id, "status": task.status.value}
         if op == "edit":
-            asset = self.service.gallery.edit(
+            self._ensure_asset_idle(asset_id)
+            asset = self.gallery_management.edit(
                 asset_id,
                 name=name or None,
                 manual_tags=tags,
@@ -610,18 +661,16 @@ class MaiTuPhotoPlugin(MaiBotPlugin):
             )
             return {"success": True, "task_id": task.id, "status": task.status.value}
         if op in {"enable", "disable"}:
-            if op == "enable":
-                asset = self.service.gallery.require(asset_id)
-                validation = validate_reference_tags(asset.category, asset.effective_tags)
-                if not validation.selectable:
-                    raise ValueError("标签未通过 Schema/场景资格校验，不能审核通过；请先重标或修正标签")
-                asset = self.service.gallery.enable(asset.id)
-            else:
-                asset = self.service.gallery.disable(asset_id)
+            self._ensure_asset_idle(asset_id)
+            asset = (
+                self.gallery_management.enable(asset_id)
+                if op == "enable"
+                else self.gallery_management.disable(asset_id)
+            )
             return {"success": True, "asset": self._asset_data(asset)}
         if op == "delete":
             asset = self.service.gallery.require(asset_id)
-            action_key = f"delete:{asset.id}"
+            action_key = f"delete:{asset.id}:{asset.updated_at.isoformat()}"
             if not self._consume_confirmation(confirm_token, action_key, invocation.user_id):
                 token = self._issue_confirmation(action_key, invocation.user_id)
                 return {
@@ -631,8 +680,9 @@ class MaiTuPhotoPlugin(MaiBotPlugin):
                     "expires_in_seconds": 300,
                     "content": "再次调用 delete 并传入 confirm_token 完成删除。",
                 }
-            deleted = self.service.gallery.soft_delete(asset.id)
-            self._unlink_asset_files(deleted)
+            self._ensure_asset_idle(asset.id)
+            deleted = self.gallery_management.delete(asset.id, expected_version=asset.updated_at.isoformat())
+            self._require_cleanup_success(deleted)
             return {"success": True, "deleted_asset_id": deleted.id}
         raise ValueError(f"不支持的图库操作: {op}")
 
@@ -703,14 +753,15 @@ class MaiTuPhotoPlugin(MaiBotPlugin):
             if person is None:
                 return "尚未设置人物参考图。"
             token = command.options.get("confirm_token", command.args[0] if command.args else "")
-            action_key = f"clear-person:{person.id}"
+            action_key = f"clear-person:{person.id}:{person.updated_at.isoformat()}"
             if not self._consume_confirmation(token, action_key, invocation.user_id):
                 issued = self._issue_confirmation(action_key, invocation.user_id)
                 return (
                     f"危险操作，请在 5 分钟内再次执行：{self.config.plugin.command_prefix} 人物 清空 确认令牌={issued}"
                 )
-            deleted = self.service.gallery.soft_delete(person.id)
-            self._unlink_asset_files(deleted)
+            self._ensure_asset_idle(person.id)
+            deleted = self.gallery_management.delete(person.id, expected_version=person.updated_at.isoformat())
+            self._require_cleanup_success(deleted)
             return "人物参考图已清空。"
         raise CommandParseError("人物 支持 提取/导入/生成/查看/重生成/清空")
 
@@ -748,7 +799,8 @@ class MaiTuPhotoPlugin(MaiBotPlugin):
             await self._send_asset(asset, invocation.stream_id)
             return self._format_asset(asset)
         if command.action == "edit":
-            edited = self.service.gallery.edit(
+            self._ensure_asset_idle(asset.id)
+            edited = self.gallery_management.edit(
                 asset.id,
                 name=command.options.get("name") or None,
                 manual_tags=parse_tags(command.options.get("tags")),
@@ -777,15 +829,14 @@ class MaiTuPhotoPlugin(MaiBotPlugin):
             )
             return f"替换任务已排队：{task.id}"
         if command.action == "enable":
-            validation = validate_reference_tags(asset.category, asset.effective_tags)
-            if not validation.selectable:
-                raise ValueError("标签未通过 Schema/场景资格校验，不能审核通过；请先重标或修正标签")
-            return f"已启用：{self._format_asset(self.service.gallery.enable(asset.id))}"
+            self._ensure_asset_idle(asset.id)
+            return f"已启用：{self._format_asset(self.gallery_management.enable(asset.id))}"
         if command.action == "disable":
-            return f"已停用：{self._format_asset(self.service.gallery.disable(asset.id))}"
+            self._ensure_asset_idle(asset.id)
+            return f"已停用：{self._format_asset(self.gallery_management.disable(asset.id))}"
         if command.action == "delete":
             token = command.options.get("confirm_token", command.args[1] if len(command.args) > 1 else "")
-            key = f"delete:{asset.id}"
+            key = f"delete:{asset.id}:{asset.updated_at.isoformat()}"
             if not self._consume_confirmation(token, key, invocation.user_id):
                 issued = self._issue_confirmation(key, invocation.user_id)
                 return (
@@ -793,8 +844,9 @@ class MaiTuPhotoPlugin(MaiBotPlugin):
                     f"{self.config.plugin.command_prefix} 参考 删除 {asset.id} "
                     f"确认令牌={issued}"
                 )
-            deleted = self.service.gallery.soft_delete(asset.id)
-            self._unlink_asset_files(deleted)
+            self._ensure_asset_idle(asset.id)
+            deleted = self.gallery_management.delete(asset.id, expected_version=asset.updated_at.isoformat())
+            self._require_cleanup_success(deleted)
             return f"已删除参考图：{asset.id}"
         raise CommandParseError("未知参考操作")
 
@@ -989,10 +1041,21 @@ class MaiTuPhotoPlugin(MaiBotPlugin):
         if not sent:
             raise RuntimeError("参考图发送失败")
 
-    @staticmethod
-    def _unlink_asset_files(asset: ReferenceAsset) -> None:
-        for path in {asset.source_path, asset.reference_path}:
-            path.unlink(missing_ok=True)
+    @property
+    def gallery_management(self) -> GalleryManagement:
+        return GalleryManagement(self.service.gallery, self.service.data_dir)
+
+    def _ensure_asset_idle(self, asset_id: str) -> None:
+        self.service.ensure_reference_idle(asset_id)
+
+    def _require_cleanup_success(self, asset: ReferenceAsset) -> None:
+        if self._webui is not None:
+            try:
+                self._webui.images.invalidate(asset.id)
+            except OSError as exc:
+                raise RuntimeError("参考图已从图库删除，但预览清理失败，请检查插件日志") from exc
+        if asset.selection_metadata.get("cleanup_error"):
+            raise RuntimeError("参考图已从图库删除，但图片清理失败，请检查插件日志")
 
     @staticmethod
     def _raw_command(kwargs: Mapping[str, Any]) -> str:
