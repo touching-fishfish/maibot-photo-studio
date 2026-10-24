@@ -57,6 +57,8 @@ def test_components_can_be_discovered_before_config_injection() -> None:
 
     assert {item["name"] for item in components} == {
         "maitu_admin",
+        "generate_image",
+        "maitu_photo_inbound_gate",
         "generate_scene_photo",
         "generate_photo",
         "get_image_task_status",

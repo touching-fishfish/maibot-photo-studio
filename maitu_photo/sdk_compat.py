@@ -7,7 +7,8 @@ from enum import Enum
 from typing import Any, Callable
 
 try:  # pragma: no cover - exercised by MaiBot and SDK integration tests
-    from maibot_sdk import API, CONFIG_RELOAD_SCOPE_SELF, Command, MaiBotPlugin, Tool
+    from maibot_sdk import API, CONFIG_RELOAD_SCOPE_SELF, Command, HookHandler, MaiBotPlugin, Tool
+    from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
     from maibot_sdk.types import ToolParameterInfo as _ToolParameterInfo
     from maibot_sdk.types import ToolParamType
 
@@ -24,6 +25,24 @@ except ImportError:  # pragma: no cover - local tests use this lightweight surfa
         BOOLEAN = "boolean"
         ARRAY = "array"
         OBJECT = "object"
+
+    class HookMode(str, Enum):
+        OBSERVE = "observe"
+        BLOCKING = "blocking"
+
+    class HookOrder(str, Enum):
+        EARLY = "early"
+        LATE = "late"
+
+    class ErrorPolicy(str, Enum):
+        SKIP = "skip"
+        RAISE = "raise"
+
+    def HookHandler(event: str = "", **metadata: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        def decorator(function: Callable[..., Any]) -> Callable[..., Any]:
+            return function
+
+        return decorator
 
     @dataclass(slots=True)
     class _ToolParameterInfo:
@@ -167,6 +186,10 @@ __all__ = [
     "API",
     "CONFIG_RELOAD_SCOPE_SELF",
     "Command",
+    "ErrorPolicy",
+    "HookHandler",
+    "HookMode",
+    "HookOrder",
     "MaiBotPlugin",
     "SDK_AVAILABLE",
     "Tool",

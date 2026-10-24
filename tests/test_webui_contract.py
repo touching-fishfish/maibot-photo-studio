@@ -100,7 +100,7 @@ def _accepts(parameter: dict[str, Any], value: Any) -> bool:
 
 def test_schema2_custom_workspace_and_private_api_bindings() -> None:
     assert DECLARATION["schema_version"] == 2
-    assert DECLARATION["workspace_title"] == "麦麦写真"
+    assert DECLARATION["workspace_title"] == "大肥鱼出图"
     assert set(DECLARATION["required_capabilities"]) == {"custom_pages", "image_upload", "structured_arguments"}
     assert [(page["id"], page["title"]) for page in DECLARATION["pages"]] == [
         ("gallery", "参考图库"),
@@ -183,8 +183,8 @@ def test_standard_library_build_is_deterministic_and_current(tmp_path: Path) -> 
         assert len(document.encode("utf-8")) < 2 * 1024 * 1024
         assert "@@" not in document
     command = [sys.executable, "-B", str(ROOT / "scripts" / "build_webui.py")]
-    subprocess.run([*command, "--output-dir", str(tmp_path)], check=True, capture_output=True, text=True)
-    subprocess.run([*command, "--output-dir", str(tmp_path), "--check"], check=True, capture_output=True, text=True)
+    subprocess.run([*command, "--output-dir", str(tmp_path)], check=True, capture_output=True, text=True, encoding="utf-8")
+    subprocess.run([*command, "--output-dir", str(tmp_path), "--check"], check=True, capture_output=True, text=True, encoding="utf-8")
     for entry, document in first.items():
         assert (tmp_path / entry).read_text(encoding="utf-8") == document
 
@@ -208,7 +208,7 @@ def test_self_contained_chinese_accessible_document_and_script_syntax(page_id: s
         )
         assert not re.search(r"\b(?:user_id|stream_id|source_path|reference_path|upload_id)\s*:", script)
         if shutil.which("node"):
-            subprocess.run(["node", "--check"], input=script, text=True, capture_output=True, check=True)
+            subprocess.run(["node", "--check"], input=script, text=True, capture_output=True, check=True, encoding="utf-8")
     for method in ("ready", "query", "action", "upload", "navigate", "context"):
         assert f"window.maibot.{method}" in document
     for control in parser.controls:
@@ -595,7 +595,7 @@ const scenarios = {
         "webui_only_retry_confirm",
     ],
 )
-def test_built_pages_with_offline_fake_host_bridge(scenario: str) -> None:
+def test_built_pages_with_offline_fake_host_bridge(scenario: str, tmp_path: Path) -> None:
     if not shutil.which("node"):
         pytest.skip("此离线协议测试需要 Node；未执行不应宣称交互通过")
     controls = {}
@@ -606,8 +606,10 @@ def test_built_pages_with_offline_fake_host_bridge(scenario: str) -> None:
         parser.feed(document)
         controls[page_id] = parser.controls
         scripts[page_id] = re.findall(r"<script>(.*?)</script>", document, re.S)
+    harness_path = tmp_path / "webui-harness.cjs"
+    harness_path.write_text(NODE_HARNESS, encoding="utf-8")
     result = subprocess.run(
-        ["node", "--input-type=commonjs", "-e", NODE_HARNESS],
+        ["node", str(harness_path)],
         input=json.dumps(
             {"scenario": scenario, "declaration": DECLARATION, "controls": controls, "scripts": scripts},
             ensure_ascii=False,
@@ -615,6 +617,7 @@ def test_built_pages_with_offline_fake_host_bridge(scenario: str) -> None:
         text=True,
         capture_output=True,
         timeout=20,
+        encoding="utf-8",
     )
     assert result.returncode == 0, f"{scenario}\n{result.stdout}\n{result.stderr}"
     assert json.loads(result.stdout)["passed"] == scenario

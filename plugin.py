@@ -33,6 +33,10 @@ if __package__:
         API,
         CONFIG_RELOAD_SCOPE_SELF,
         Command,
+        ErrorPolicy,
+        HookHandler,
+        HookMode,
+        HookOrder,
         MaiBotPlugin,
         Tool,
         ToolParameterInfo,
@@ -62,6 +66,10 @@ else:  # direct local import used by unit tests
         API,
         CONFIG_RELOAD_SCOPE_SELF,
         Command,
+        ErrorPolicy,
+        HookHandler,
+        HookMode,
+        HookOrder,
         MaiBotPlugin,
         Tool,
         ToolParameterInfo,
@@ -140,6 +148,31 @@ class MaiTuPhotoPlugin(MaiBotPlugin):
         self._webui: PhotoWebUI | None = None
         self._webui_lock = asyncio.Lock()
         self._confirmations: dict[str, tuple[float, str, str, str]] = {}
+        # 会话 → 对方最近一句话（generate_image 严格门控用）
+        self._last_inbound: dict[str, str] = {}
+
+    # 普通生图工具的严格触发门控：只有用户原话包含明确生成指令时才放行
+    _PLAIN_IMAGE_GATE = re.compile(
+        r"(帮我(?:生成|画|做|整|制作|来)|生成|画一?[张个幅]|做一?[张个幅]|来一?[张个幅]|整一?[张个幅]|制作一?[张个幅])"
+    )
+
+    @HookHandler(
+        "chat.receive.after_process",
+        mode=HookMode.OBSERVE,
+        name="maitu_photo_inbound_gate",
+        description="记录对方最近一句话，用于普通生图工具的严格触发门控",
+        order=HookOrder.LATE,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def _on_inbound_message(self, **kwargs: Any) -> None:
+        message = kwargs.get("message")
+        if not isinstance(message, dict):
+            return
+        session_id = str(message.get("session_id") or "").strip()
+        text = str(message.get("processed_plain_text") or "").strip()
+        if not text or not session_id:
+            return
+        self._last_inbound[session_id] = text
 
     async def on_load(self) -> None:
         data_dir = Path(self.ctx.paths.data_dir)
@@ -341,6 +374,52 @@ class MaiTuPhotoPlugin(MaiBotPlugin):
                 scene_id=scene_id,
                 use_scene_reference=use_scene_reference,
                 force_new_scene=force_new_scene,
+                size=size,
+                model_id=model_id,
+            )
+            return {"success": True, "task_id": task.id, "status": task.status.value}
+        except Exception as exc:
+            return self._tool_error(exc)
+
+    @Tool(
+        "generate_image",
+        brief_description="按任意要求生成一张图片（需用户明确说“生成/画一张”）",
+        detailed_description=(
+            "仅当用户原话明确包含“帮我生成/帮我画/生成一张/画一张/做一张/来一张”等生成指令，"
+            "且该请求与 bot 本人出镜、真实场景照片无关时才使用本工具"
+            "（例如头像、插画、表情包、概念图、海报等）。"
+            "description 需写清内容与风格（写实/卡通/Q版/像素等），并给出构图与配色要求。"
+            "用户没有明确生成指令时，一律改用 generate_photo 或 generate_scene_photo。"
+        ),
+        parameters=[
+            ToolParameterInfo("description", ToolParamType.STRING, "图片需求描述（内容、风格、构图、配色）", required=True),
+            ToolParameterInfo("size", ToolParamType.STRING, "图片尺寸，如 1024x1024，缺省用插件默认", required=False, default=""),
+            ToolParameterInfo("model_id", ToolParamType.STRING, "模型覆盖", required=False, default=""),
+        ],
+    )
+    async def handle_generate_image(
+        self,
+        description: str,
+        size: str = "",
+        model_id: str = "",
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        try:
+            self._require_enabled()
+            invocation = invocation_context(kwargs)
+            # 严格门控：用户原话必须包含明确生成指令
+            last_text = (self._last_inbound.get(invocation.stream_id) or "").strip()
+            if not self._PLAIN_IMAGE_GATE.search(last_text):
+                return {
+                    "success": False,
+                    "message": (
+                        "用户没有明确要求“生成一张图片”。请改用 generate_photo（bot 出镜照）"
+                        "或 generate_scene_photo（真实场景照片）工具处理。"
+                    ),
+                }
+            task = self.service.submit_plain_image(
+                invocation,
+                description=description,
                 size=size,
                 model_id=model_id,
             )

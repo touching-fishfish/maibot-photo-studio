@@ -399,7 +399,7 @@ def _guard_task(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["photo", "scene_photo", "image"])
+@pytest.mark.parametrize("kind", ["photo", "scene_photo"])
 async def test_shared_busy_guard_covers_references_held_by_selector_across_await(tmp_path: Path, kind: str) -> None:
     ctx = _Context([])
     config = _config()

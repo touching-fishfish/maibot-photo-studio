@@ -139,6 +139,59 @@ def test_images_generation_uses_expected_endpoint_and_parses_b64_json() -> None:
     }
 
 
+def test_normalize_keeps_existing_version_segment() -> None:
+    """已有 /v1、/v3、/v4 等版本段的地址保持不变，其余地址补 /v1。"""
+
+    assert normalize_base_url("https://api.example.test") == "https://api.example.test/v1"
+    assert normalize_base_url("https://api.example.test/v1") == "https://api.example.test/v1"
+    assert (
+        normalize_base_url("https://ark.cn-beijing.volces.com/api/v3")
+        == "https://ark.cn-beijing.volces.com/api/v3"
+    )
+    assert (
+        normalize_base_url("https://open.bigmodel.cn/api/paas/v4")
+        == "https://open.bigmodel.cn/api/paas/v4"
+    )
+    assert normalize_base_url("https://api.example.test/api") == "https://api.example.test/api/v1"
+
+
+def test_ark_images_mode_posts_data_uri_to_generations() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["json"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={"data": [{"b64_json": base64.b64encode(_png()).decode()}]},
+            request=request,
+        )
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            provider = OpenAICompatibleProvider(
+                "https://ark.cn-beijing.volces.com/api/v3",
+                "test-key",
+                generation_model="seedream",
+                mode="ark_images",
+                client=client,
+            )
+            return await provider.generate(
+                "同一个人物拍窗外天空",
+                image_refs=[_png()],
+                size="1024x1024",
+                response_format="url",
+            )
+
+    result = _run(scenario())
+    assert result.data == _png()
+    assert seen["url"] == "https://ark.cn-beijing.volces.com/api/v3/images/generations"
+    payload = seen["json"]
+    assert payload["model"] == "seedream"
+    assert payload["watermark"] is False
+    assert payload["image"].startswith("data:image/png;base64,")
+
+
 def test_images_generation_includes_explicit_response_format() -> None:
     seen: dict[str, object] = {}
 

@@ -2,7 +2,7 @@
   "manifest_version": 2,
   "id": "maitu.photo-studio",
   "version": "0.2.0",
-  "name": "麦麦写真",
+  "name": "大肥鱼出图",
   "description": "让麦麦更真实地发送照片：真实照片生成、人物/服装/场景参考图库与聊天连续性。",
   "author": {
     "name": "tsuiraku9",
@@ -10,7 +10,7 @@
   },
   "license": "MIT",
   "urls": {
-    "repository": "https://github.com/tsuiraku9/maitu-photo-studio",
+    "repository": "https://github.com/touching-fishfish/maibot-photo-studio",
     "homepage": "https://github.com/tsuiraku9/maitu-photo-studio",
     "documentation": "https://github.com/tsuiraku9/maitu-photo-studio/blob/main/README.md",
     "issues": "https://github.com/tsuiraku9/maitu-photo-studio/issues"
@@ -24,8 +24,16 @@
     "max_version": "2.99.99"
   },
   "dependencies": [
-    {"type": "python_package", "name": "Pillow", "version_spec": ">=11.0.0"},
-    {"type": "python_package", "name": "httpx", "version_spec": ">=0.27.0"}
+    {
+      "type": "python_package",
+      "name": "Pillow",
+      "version_spec": ">=11.0.0"
+    },
+    {
+      "type": "python_package",
+      "name": "httpx",
+      "version_spec": ">=0.27.0"
+    }
   ],
   "plugin_type": "media",
   "capabilities": [
@@ -48,6 +56,8 @@
   },
   "i18n": {
     "default_locale": "zh-CN",
-    "supported_locales": ["zh-CN"]
+    "supported_locales": [
+      "zh-CN"
+    ]
   }
 }

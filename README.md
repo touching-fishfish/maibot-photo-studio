@@ -1,3 +1,21 @@
+## Alan 分享版
+
+这是 [原项目](https://github.com/tsuiraku9/maitu-photo-studio) 的本地补丁分享版，原作者和许可证保留。
+
+增加方舟 ark_images 模式、版本路径保留、参考图请求修复、普通生图工具与明确指令触发门控；名称改为大肥鱼出图。
+
+安装时使用本仓库的默认分支 `alan-local`：
+
+```sh
+git clone --branch alan-local https://github.com/touching-fishfish/maibot-photo-studio.git
+```
+
+将克隆的插件文件夹放入 MaiBot 的 `plugins/`，按下方原版说明安装依赖、填写自己的配置，重启 MaiBot 后启用。
+
+本仓库只带源码和通用配置示例；API 密钥、参考音频、模型权重和个人数据须自行配置。[本地补丁与验证范围](LOCAL_CHANGES.md)。
+
+---
+
 # 麦麦写真 · 让麦麦更真实地发送照片
 
 `麦麦写真`（Manifest ID：`maitu.photo-studio`）为 MaiBot 提供可配置的照片生成、参考图库与异步投递能力。它将照片请求保存为后台任务，按需选择参考图，生成完成后把图片发送回原聊天。插件本身不提供模型、网关或额度；图片由使用者配置的服务生成。

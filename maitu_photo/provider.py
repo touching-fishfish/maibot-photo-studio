@@ -36,7 +36,7 @@ DEFAULT_MAX_RETRIES = 0
 DEFAULT_RETRY_BACKOFF_SECONDS = 1.0
 MAX_RETRIES = 5
 MAX_RETRY_BACKOFF_SECONDS = 60.0
-SUPPORTED_MODES = frozenset({"images_api", "images_json", "chat_completions"})
+SUPPORTED_MODES = frozenset({"images_api", "images_json", "ark_images", "chat_completions"})
 _IMAGE_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _BLOCKED_IMAGE_HOSTNAMES = frozenset({"localhost", "localhost.localdomain", "metadata.google.internal"})
 
@@ -99,7 +99,12 @@ def _redact(value: object) -> str:
 
 
 def normalize_base_url(base_url: str) -> str:
-    """Return a canonical API root ending in exactly one ``/v1`` segment."""
+    """Return a canonical API root ending in a version segment such as ``/v1``.
+
+    Paths that already end with a version segment (``/v1``, ``/api/v3``,
+    ``/api/paas/v4`` ...) are kept as-is so providers like Ark and Zhipu keep
+    their own routing; other paths receive the default ``/v1`` suffix.
+    """
 
     if not isinstance(base_url, str) or not base_url.strip():
         raise ProviderConfigError("base_url is required")
@@ -114,7 +119,7 @@ def normalize_base_url(base_url: str) -> str:
     path = parsed.path.rstrip("/")
     if not path or path == "/":
         path = "/v1"
-    elif not path.lower().endswith("/v1"):
+    elif not re.search(r"/v\d+$", path.lower()):
         path = f"{path}/v1"
     return f"{parsed.scheme}://{parsed.netloc}{path}"
 
@@ -509,6 +514,11 @@ class OpenAICompatibleProvider:
     def endpoint(self, path: str) -> str:
         return f"{self.base_url}/{path.lstrip('/')}"
 
+    def _ark_default_response_format(self) -> str | None:
+        """方舟系网关默认返回 b64_json，避开 TOS 图片 URL 下载校验。"""
+        host = (urlsplit(self.base_url).hostname or "").casefold()
+        return "b64_json" if host.endswith("volces.com") else None
+
     def _headers(self, *, json_request: bool = True, include_auth: bool = True) -> dict[str, str]:
         result = {"Accept": "application/json", **self._extra_headers}
         if include_auth and self.api_key:
@@ -534,6 +544,9 @@ class OpenAICompatibleProvider:
             "images-json": "images_json",
             "image_json": "images_json",
             "json_edits": "images_json",
+            "ark": "ark_images",
+            "ark_images": "ark_images",
+            "ark-image": "ark_images",
             "chat": "chat_completions",
             "chat_completion": "chat_completions",
             "chat-completion": "chat_completions",
@@ -928,9 +941,14 @@ class OpenAICompatibleProvider:
 
         for attempt in range(retries + 1):
             try:
-                if selected_mode in {"images_api", "images_json"}:
+                if selected_mode in {"images_api", "images_json", "ark_images"}:
                     if materialized_refs:
-                        edit = self._images_edit_json if selected_mode == "images_json" else self._images_edit
+                        if selected_mode == "ark_images":
+                            edit = self._images_edit_ark
+                        elif selected_mode == "images_json":
+                            edit = self._images_edit_json
+                        else:
+                            edit = self._images_edit
                         response = await edit(
                             prompt,
                             materialized_refs,
@@ -945,6 +963,9 @@ class OpenAICompatibleProvider:
                             extra=extra,
                         )
                     else:
+                        gen_extra = extra
+                        if selected_mode == "ark_images":
+                            gen_extra = {**(extra or {}), "watermark": False}
                         response = await self._images_generate(
                             prompt,
                             model=selected_model,
@@ -955,7 +976,7 @@ class OpenAICompatibleProvider:
                             moderation=moderation,
                             n=n,
                             response_format=response_format,
-                            extra=extra,
+                            extra=gen_extra,
                         )
                 else:
                     response = await self._chat_generate(
@@ -1038,6 +1059,7 @@ class OpenAICompatibleProvider:
             output_format=output_format,
             moderation=moderation,
         )
+        response_format = response_format or self._ark_default_response_format()
         if response_format:
             payload["response_format"] = response_format
         if extra:
@@ -1137,6 +1159,48 @@ class OpenAICompatibleProvider:
         if extra:
             payload.update(dict(extra))
         return await self._post_json(self.endpoint("images/edits"), payload)
+
+    async def _images_edit_ark(
+        self,
+        prompt: str,
+        images: Sequence[ImageInput],
+        *,
+        model: str,
+        size: str | None,
+        negative_prompt: str | None,
+        quality: str | None,
+        output_format: str | None,
+        moderation: str | None,
+        n: int,
+        response_format: str | None,
+        extra: Mapping[str, Any] | None,
+    ) -> httpx.Response:
+        """POST ``/images/generations`` JSON with data-URL reference images.
+
+        Ark (Seedream) has no ``/images/edits`` endpoint; image-to-image runs
+        on the standard generations endpoint with ``image`` as a data URI or
+        URL and ``watermark`` explicitly disabled.  Only fields Ark accepts are
+        forwarded; quality/output_format/moderation are intentionally omitted.
+        """
+
+        if not images:
+            raise ProviderConfigError("at least one reference image is required for ark image edits")
+        refs: list[str] = []
+        for image in images:
+            data, media, _ = _coerce_input_bytes(image)
+            encoded = base64.b64encode(data).decode("ascii")
+            refs.append(f"data:{media};base64,{encoded}")
+        payload: dict[str, Any] = {"model": model, "prompt": prompt, "n": n, "watermark": False}
+        payload["image"] = refs[0] if len(refs) == 1 else refs
+        if size:
+            payload["size"] = size
+        # 方舟结果默认走 TOS 对象存储 URL，会被插件的 DNS 防重绑定校验误杀；
+        # 强制 b64_json 让图片直接内嵌返回，绕开 URL 下载整条路径。
+        response_format = response_format or "b64_json"
+        payload["response_format"] = response_format
+        if extra:
+            payload.update(dict(extra))
+        return await self._post_json(self.endpoint("images/generations"), payload)
 
     async def _chat_generate(
         self,

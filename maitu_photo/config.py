@@ -52,7 +52,7 @@ def _tool_text_ui(label: str, purpose: str, *, rows: int = 4) -> dict[str, Any]:
     return _ui(label, purpose.strip(), **{"x-widget": "textarea", "rows": rows})
 
 
-RequestMode = Literal["images_api", "images_json", "chat_completions"]
+RequestMode = Literal["images_api", "images_json", "ark_images", "chat_completions"]
 ImageQuality = Literal["auto", "low", "medium", "high", "xhigh", "max", "standard", "hd"]
 ImageOutputFormat = Literal["png", "jpeg", "webp"]
 ImageModeration = Literal["auto", "low"]
@@ -60,6 +60,7 @@ _REQUEST_MODE_HINT = (
     "按服务商选择，失败后不会改用其他方式。"
     "images_api：OpenAI Images，参考图用 multipart。"
     "images_json：参考图用 JSON（Grok Imagine 等）。"
+    "ark_images：火山方舟 Seedream，参考图用 data-URL 走 /images/generations。"
     "chat_completions：多模态聊天生图（Gemini 等）。"
 )
 

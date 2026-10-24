@@ -27,3 +27,16 @@ MaiBot-*.zip
 # OS
 .DS_Store
 Thumbs.db
+
+# Local-only configuration, backups and runtime data
+config.toml
+config_back/
+config.toml.*
+.maibot-release.json
+__pycache__/
+*.py[cod]
+.pytest_cache/
+data/
+logs/
+.env
+.venv/

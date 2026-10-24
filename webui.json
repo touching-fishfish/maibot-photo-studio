@@ -1,135 +1,644 @@
 {
   "schema_version": 2,
-  "required_capabilities": ["custom_pages", "image_upload", "structured_arguments"],
-  "workspace_title": "麦麦写真",
+  "required_capabilities": [
+    "custom_pages",
+    "image_upload",
+    "structured_arguments"
+  ],
+  "workspace_title": "大肥鱼出图",
   "pages": [
     {
-      "id": "gallery", "title": "参考图库", "description": "人物、服装和场景参考素材。上传只暂存，提交后才会调用模型。",
-      "placement": "workspace", "icon": "database", "mode": "custom", "entry": "webui/gallery.html", "layout": "document",
+      "id": "gallery",
+      "title": "参考图库",
+      "description": "人物、服装和场景参考素材。上传只暂存，提交后才会调用模型。",
+      "placement": "workspace",
+      "icon": "database",
+      "mode": "custom",
+      "entry": "webui/gallery.html",
+      "layout": "document",
       "queries": {
         "gallery": {
-          "api": "webui_gallery_query", "version": "1",
+          "api": "webui_gallery_query",
+          "version": "1",
           "parameters": {
-            "operation": {"type": "string", "choices": ["list", "detail", "images", "settings"]},
-            "args": {"type": "object", "properties": {
-              "category": {"type": "string", "choices": ["", "person", "outfit", "scene"]},
-              "status": {"type": "string", "choices": ["", "active", "disabled", "needs_review"]},
-              "search": {"type": "string", "max_length": 4000},
-              "offset": {"type": "integer", "minimum": 0},
-              "limit": {"type": "integer", "minimum": 1, "maximum": 24},
-              "asset_id": {"type": "string", "max_length": 128},
-              "asset_ids": {"type": "array", "max_items": 6, "items": {"type": "string", "max_length": 128}},
-              "variant": {"type": "string", "choices": ["thumbnail", "source", "reference"]}
-            }}
+            "operation": {
+              "type": "string",
+              "choices": [
+                "list",
+                "detail",
+                "images",
+                "settings"
+              ]
+            },
+            "args": {
+              "type": "object",
+              "properties": {
+                "category": {
+                  "type": "string",
+                  "choices": [
+                    "",
+                    "person",
+                    "outfit",
+                    "scene"
+                  ]
+                },
+                "status": {
+                  "type": "string",
+                  "choices": [
+                    "",
+                    "active",
+                    "disabled",
+                    "needs_review"
+                  ]
+                },
+                "search": {
+                  "type": "string",
+                  "max_length": 4000
+                },
+                "offset": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "limit": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 24
+                },
+                "asset_id": {
+                  "type": "string",
+                  "max_length": 128
+                },
+                "asset_ids": {
+                  "type": "array",
+                  "max_items": 6,
+                  "items": {
+                    "type": "string",
+                    "max_length": 128
+                  }
+                },
+                "variant": {
+                  "type": "string",
+                  "choices": [
+                    "thumbnail",
+                    "source",
+                    "reference"
+                  ]
+                }
+              }
+            }
           }
         },
         "tasks": {
-          "api": "webui_task_query", "version": "1",
+          "api": "webui_task_query",
+          "version": "1",
           "parameters": {
-            "operation": {"type": "string", "choices": ["list", "detail", "receipt"]},
-            "args": {"type": "object", "properties": {
-              "status": {"type": "string", "choices": ["", "queued", "running", "generated", "completed", "sent", "failed", "cancelled"]},
-              "origin": {"type": "string", "choices": ["", "webui", "qq", "automatic", "startup", "unknown"]},
-              "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 24},
-              "task_id": {"type": "string", "max_length": 128}, "request_id": {"type": "string", "max_length": 128}
-            }}
+            "operation": {
+              "type": "string",
+              "choices": [
+                "list",
+                "detail",
+                "receipt"
+              ]
+            },
+            "args": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "choices": [
+                    "",
+                    "queued",
+                    "running",
+                    "generated",
+                    "completed",
+                    "sent",
+                    "failed",
+                    "cancelled"
+                  ]
+                },
+                "origin": {
+                  "type": "string",
+                  "choices": [
+                    "",
+                    "webui",
+                    "qq",
+                    "automatic",
+                    "startup",
+                    "unknown"
+                  ]
+                },
+                "offset": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "limit": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 24
+                },
+                "task_id": {
+                  "type": "string",
+                  "max_length": 128
+                },
+                "request_id": {
+                  "type": "string",
+                  "max_length": 128
+                }
+              }
+            }
           }
         }
       },
       "actions": {
         "manage": {
-          "api": "webui_gallery_action", "version": "1",
+          "api": "webui_gallery_action",
+          "version": "1",
           "parameters": {
-            "operation": {"type": "string", "required": true, "choices": ["edit", "enable", "disable", "delete", "confirm", "prepare_preview", "submit", "cancel", "retry"]},
-            "request_id": {"type": "string", "required": true, "max_length": 128},
-            "confirm_token": {"type": "string", "max_length": 4000},
-            "args": {"type": "object", "required": true, "properties": {
-              "asset_id": {"type": "string", "max_length": 128}, "name": {"type": "string", "max_length": 200},
-              "manual_tags": {"type": "object", "properties": {
-                "appearance_summary": {"type": "string", "max_length": 4000}, "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                "type": {"type": "string", "max_length": 4000},
-                "wearing_scenes": {"type": "array", "max_items": 100, "items": {"type": "string", "max_length": 4000}},
-                "seasons": {"type": "array", "max_items": 100, "items": {"type": "string", "max_length": 4000}},
-                "styles": {"type": "array", "max_items": 100, "items": {"type": "string", "max_length": 4000}},
-                "room_type": {"type": "string", "max_length": 4000}, "privacy_eligible": {"type": "boolean"}, "scene_signature": {"type": "string", "max_length": 4000}
-              }},
-              "expected_version": {"type": "string", "max_length": 200},
-              "ids": {"type": "array", "max_items": 20, "items": {"type": "string", "max_length": 128}},
-              "versions": {"type": "array", "max_items": 20, "items": {"type": "object", "properties": {
-                "asset_id": {"type": "string", "required": true, "max_length": 128}, "updated_at": {"type": "string", "required": true, "max_length": 200}
-              }}},
-              "asset_ids": {"type": "array", "max_items": 6, "items": {"type": "string", "max_length": 128}},
-              "variant": {"type": "string", "choices": ["thumbnail", "source", "reference"]},
-              "operation": {"type": "string", "choices": ["import", "extract", "replace", "retag", "regenerate", "generate_person"]},
-              "category": {"type": "string", "choices": ["person", "outfit", "scene"]},
-              "stage_id": {"type": "string", "max_length": 128}, "batch_id": {"type": "string", "max_length": 128},
-              "person_version": {"type": "string", "max_length": 400}, "appearance_hint": {"type": "string", "max_length": 4000},
-              "task_id": {"type": "string", "max_length": 128},
-              "action": {"type": "string", "choices": ["submit", "delete", "retry", "batch_submit"]},
-              "target_request_id": {"type": "string", "max_length": 128},
-              "params": {"type": "object", "properties": {
-                "operation": {"type": "string", "choices": ["import", "extract", "replace", "retag", "regenerate", "generate_person"]},
-                "category": {"type": "string", "choices": ["person", "outfit", "scene"]},
-                "name": {"type": "string", "max_length": 200}, "asset_id": {"type": "string", "max_length": 128},
-                "stage_id": {"type": "string", "max_length": 128}, "batch_id": {"type": "string", "max_length": 128},
-                "expected_version": {"type": "string", "max_length": 200}, "person_version": {"type": "string", "max_length": 400},
-                "appearance_hint": {"type": "string", "max_length": 4000}, "task_id": {"type": "string", "max_length": 128},
-                "ids": {"type": "array", "max_items": 20, "items": {"type": "string", "max_length": 128}},
-                "versions": {"type": "array", "max_items": 20, "items": {"type": "object", "properties": {
-                  "asset_id": {"type": "string", "required": true, "max_length": 128}, "updated_at": {"type": "string", "required": true, "max_length": 200}
-                }}},
-                "items": {"type": "array", "max_items": 20, "items": {"type": "object", "properties": {
-                  "request_id": {"type": "string", "required": true, "max_length": 128},
-                  "operation": {"type": "string", "required": true, "choices": ["import", "extract", "replace", "retag", "regenerate", "generate_person"]},
-                  "category": {"type": "string", "choices": ["person", "outfit", "scene"]},
-                  "name": {"type": "string", "max_length": 200}, "asset_id": {"type": "string", "max_length": 128},
-                  "stage_id": {"type": "string", "max_length": 128}, "batch_id": {"type": "string", "max_length": 128},
-                  "expected_version": {"type": "string", "max_length": 200}, "person_version": {"type": "string", "max_length": 400},
-                  "appearance_hint": {"type": "string", "max_length": 4000}
-                }}}
-              }}
-            }}
+            "operation": {
+              "type": "string",
+              "required": true,
+              "choices": [
+                "edit",
+                "enable",
+                "disable",
+                "delete",
+                "confirm",
+                "prepare_preview",
+                "submit",
+                "cancel",
+                "retry"
+              ]
+            },
+            "request_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 128
+            },
+            "confirm_token": {
+              "type": "string",
+              "max_length": 4000
+            },
+            "args": {
+              "type": "object",
+              "required": true,
+              "properties": {
+                "asset_id": {
+                  "type": "string",
+                  "max_length": 128
+                },
+                "name": {
+                  "type": "string",
+                  "max_length": 200
+                },
+                "manual_tags": {
+                  "type": "object",
+                  "properties": {
+                    "appearance_summary": {
+                      "type": "string",
+                      "max_length": 4000
+                    },
+                    "confidence": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 1
+                    },
+                    "type": {
+                      "type": "string",
+                      "max_length": 4000
+                    },
+                    "wearing_scenes": {
+                      "type": "array",
+                      "max_items": 100,
+                      "items": {
+                        "type": "string",
+                        "max_length": 4000
+                      }
+                    },
+                    "seasons": {
+                      "type": "array",
+                      "max_items": 100,
+                      "items": {
+                        "type": "string",
+                        "max_length": 4000
+                      }
+                    },
+                    "styles": {
+                      "type": "array",
+                      "max_items": 100,
+                      "items": {
+                        "type": "string",
+                        "max_length": 4000
+                      }
+                    },
+                    "room_type": {
+                      "type": "string",
+                      "max_length": 4000
+                    },
+                    "privacy_eligible": {
+                      "type": "boolean"
+                    },
+                    "scene_signature": {
+                      "type": "string",
+                      "max_length": 4000
+                    }
+                  }
+                },
+                "expected_version": {
+                  "type": "string",
+                  "max_length": 200
+                },
+                "ids": {
+                  "type": "array",
+                  "max_items": 20,
+                  "items": {
+                    "type": "string",
+                    "max_length": 128
+                  }
+                },
+                "versions": {
+                  "type": "array",
+                  "max_items": 20,
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "asset_id": {
+                        "type": "string",
+                        "required": true,
+                        "max_length": 128
+                      },
+                      "updated_at": {
+                        "type": "string",
+                        "required": true,
+                        "max_length": 200
+                      }
+                    }
+                  }
+                },
+                "asset_ids": {
+                  "type": "array",
+                  "max_items": 6,
+                  "items": {
+                    "type": "string",
+                    "max_length": 128
+                  }
+                },
+                "variant": {
+                  "type": "string",
+                  "choices": [
+                    "thumbnail",
+                    "source",
+                    "reference"
+                  ]
+                },
+                "operation": {
+                  "type": "string",
+                  "choices": [
+                    "import",
+                    "extract",
+                    "replace",
+                    "retag",
+                    "regenerate",
+                    "generate_person"
+                  ]
+                },
+                "category": {
+                  "type": "string",
+                  "choices": [
+                    "person",
+                    "outfit",
+                    "scene"
+                  ]
+                },
+                "stage_id": {
+                  "type": "string",
+                  "max_length": 128
+                },
+                "batch_id": {
+                  "type": "string",
+                  "max_length": 128
+                },
+                "person_version": {
+                  "type": "string",
+                  "max_length": 400
+                },
+                "appearance_hint": {
+                  "type": "string",
+                  "max_length": 4000
+                },
+                "task_id": {
+                  "type": "string",
+                  "max_length": 128
+                },
+                "action": {
+                  "type": "string",
+                  "choices": [
+                    "submit",
+                    "delete",
+                    "retry",
+                    "batch_submit"
+                  ]
+                },
+                "target_request_id": {
+                  "type": "string",
+                  "max_length": 128
+                },
+                "params": {
+                  "type": "object",
+                  "properties": {
+                    "operation": {
+                      "type": "string",
+                      "choices": [
+                        "import",
+                        "extract",
+                        "replace",
+                        "retag",
+                        "regenerate",
+                        "generate_person"
+                      ]
+                    },
+                    "category": {
+                      "type": "string",
+                      "choices": [
+                        "person",
+                        "outfit",
+                        "scene"
+                      ]
+                    },
+                    "name": {
+                      "type": "string",
+                      "max_length": 200
+                    },
+                    "asset_id": {
+                      "type": "string",
+                      "max_length": 128
+                    },
+                    "stage_id": {
+                      "type": "string",
+                      "max_length": 128
+                    },
+                    "batch_id": {
+                      "type": "string",
+                      "max_length": 128
+                    },
+                    "expected_version": {
+                      "type": "string",
+                      "max_length": 200
+                    },
+                    "person_version": {
+                      "type": "string",
+                      "max_length": 400
+                    },
+                    "appearance_hint": {
+                      "type": "string",
+                      "max_length": 4000
+                    },
+                    "task_id": {
+                      "type": "string",
+                      "max_length": 128
+                    },
+                    "ids": {
+                      "type": "array",
+                      "max_items": 20,
+                      "items": {
+                        "type": "string",
+                        "max_length": 128
+                      }
+                    },
+                    "versions": {
+                      "type": "array",
+                      "max_items": 20,
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "asset_id": {
+                            "type": "string",
+                            "required": true,
+                            "max_length": 128
+                          },
+                          "updated_at": {
+                            "type": "string",
+                            "required": true,
+                            "max_length": 200
+                          }
+                        }
+                      }
+                    },
+                    "items": {
+                      "type": "array",
+                      "max_items": 20,
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "request_id": {
+                            "type": "string",
+                            "required": true,
+                            "max_length": 128
+                          },
+                          "operation": {
+                            "type": "string",
+                            "required": true,
+                            "choices": [
+                              "import",
+                              "extract",
+                              "replace",
+                              "retag",
+                              "regenerate",
+                              "generate_person"
+                            ]
+                          },
+                          "category": {
+                            "type": "string",
+                            "choices": [
+                              "person",
+                              "outfit",
+                              "scene"
+                            ]
+                          },
+                          "name": {
+                            "type": "string",
+                            "max_length": 200
+                          },
+                          "asset_id": {
+                            "type": "string",
+                            "max_length": 128
+                          },
+                          "stage_id": {
+                            "type": "string",
+                            "max_length": 128
+                          },
+                          "batch_id": {
+                            "type": "string",
+                            "max_length": 128
+                          },
+                          "expected_version": {
+                            "type": "string",
+                            "max_length": 200
+                          },
+                          "person_version": {
+                            "type": "string",
+                            "max_length": 400
+                          },
+                          "appearance_hint": {
+                            "type": "string",
+                            "max_length": 4000
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "stage": {
-          "api": "webui_stage_upload", "version": "1",
+          "api": "webui_stage_upload",
+          "version": "1",
           "parameters": {
-            "upload_id": {"type": "string", "required": true, "max_length": 128},
-            "request_id": {"type": "string", "required": true, "max_length": 128}
+            "upload_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 128
+            },
+            "request_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 128
+            }
           }
         }
       },
-      "uploads": {"library": {"action": "stage", "image_max_edge": 2048}}
+      "uploads": {
+        "library": {
+          "action": "stage",
+          "image_max_edge": 2048
+        }
+      }
     },
     {
-      "id": "tasks", "title": "管理任务", "description": "仅网页发起的任务可取消或重试；其它来源只读。模型已开始的费用不会因取消而退回。",
-      "placement": "workspace", "icon": "list", "mode": "custom", "entry": "webui/tasks.html", "layout": "document",
+      "id": "tasks",
+      "title": "管理任务",
+      "description": "仅网页发起的任务可取消或重试；其它来源只读。模型已开始的费用不会因取消而退回。",
+      "placement": "workspace",
+      "icon": "list",
+      "mode": "custom",
+      "entry": "webui/tasks.html",
+      "layout": "document",
       "queries": {
         "tasks": {
-          "api": "webui_task_query", "version": "1",
+          "api": "webui_task_query",
+          "version": "1",
           "parameters": {
-            "operation": {"type": "string", "choices": ["list", "detail", "receipt"]},
-            "args": {"type": "object", "properties": {
-              "status": {"type": "string", "choices": ["", "queued", "running", "generated", "completed", "sent", "failed", "cancelled"]},
-              "origin": {"type": "string", "choices": ["", "webui", "qq", "automatic", "startup", "unknown"]},
-              "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 24},
-              "task_id": {"type": "string", "max_length": 128}, "request_id": {"type": "string", "max_length": 128}
-            }}
+            "operation": {
+              "type": "string",
+              "choices": [
+                "list",
+                "detail",
+                "receipt"
+              ]
+            },
+            "args": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "choices": [
+                    "",
+                    "queued",
+                    "running",
+                    "generated",
+                    "completed",
+                    "sent",
+                    "failed",
+                    "cancelled"
+                  ]
+                },
+                "origin": {
+                  "type": "string",
+                  "choices": [
+                    "",
+                    "webui",
+                    "qq",
+                    "automatic",
+                    "startup",
+                    "unknown"
+                  ]
+                },
+                "offset": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "limit": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 24
+                },
+                "task_id": {
+                  "type": "string",
+                  "max_length": 128
+                },
+                "request_id": {
+                  "type": "string",
+                  "max_length": 128
+                }
+              }
+            }
           }
         }
       },
       "actions": {
         "manage": {
-          "api": "webui_gallery_action", "version": "1",
+          "api": "webui_gallery_action",
+          "version": "1",
           "parameters": {
-            "operation": {"type": "string", "required": true, "choices": ["confirm", "cancel", "retry"]},
-            "request_id": {"type": "string", "required": true, "max_length": 128},
-            "confirm_token": {"type": "string", "max_length": 4000},
-            "args": {"type": "object", "required": true, "properties": {
-              "task_id": {"type": "string", "max_length": 128},
-              "action": {"type": "string", "choices": ["retry"]}, "target_request_id": {"type": "string", "max_length": 128},
-              "params": {"type": "object", "properties": {"task_id": {"type": "string", "required": true, "max_length": 128}}}
-            }}
+            "operation": {
+              "type": "string",
+              "required": true,
+              "choices": [
+                "confirm",
+                "cancel",
+                "retry"
+              ]
+            },
+            "request_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 128
+            },
+            "confirm_token": {
+              "type": "string",
+              "max_length": 4000
+            },
+            "args": {
+              "type": "object",
+              "required": true,
+              "properties": {
+                "task_id": {
+                  "type": "string",
+                  "max_length": 128
+                },
+                "action": {
+                  "type": "string",
+                  "choices": [
+                    "retry"
+                  ]
+                },
+                "target_request_id": {
+                  "type": "string",
+                  "max_length": 128
+                },
+                "params": {
+                  "type": "object",
+                  "properties": {
+                    "task_id": {
+                      "type": "string",
+                      "required": true,
+                      "max_length": 128
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       },

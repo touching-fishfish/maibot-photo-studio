@@ -486,6 +486,25 @@ class PhotoStudioService:
         }
         return self._submit_generation("scene_photo", invocation, payload, description)
 
+    def submit_plain_image(
+        self,
+        invocation: InvocationContext,
+        *,
+        description: str,
+        size: str = "",
+        model_id: str = "",
+    ) -> ImageTask:
+        """Queue an arbitrary image generation (no reference gallery involved)."""
+
+        if not description.strip():
+            raise ValueError("description 不能为空")
+        payload = {
+            "description": description.strip(),
+            "size": size.strip(),
+            "model_id": model_id.strip(),
+        }
+        return self._submit_generation("image", invocation, payload, description)
+
     # Backward-compatible alias used by older tests and local scripts.
     def submit_image(
         self,
@@ -1064,6 +1083,9 @@ class PhotoStudioService:
                     latest.result_metadata.pop("notification_retry", None)
                     self.storage.update_task(latest)
                 return
+            if task.kind == "image":
+                await self._generate_plain_image(task)
+                return
             if task.kind in {"image", "scene_photo", "photo"}:
                 if task.result_path and task.result_path.is_file():
                     await self._deliver(task)
@@ -1119,6 +1141,8 @@ class PhotoStudioService:
         references: list[bytes] = []
         if selection.scene is not None:
             references.append(selection.scene.reference_path.read_bytes())
+        # 带参考图时用 reference_mode（方舟走 ark_images），纯文生图才用 generation_mode
+        mode = self.config.openai.reference_mode if references else self.config.openai.generation_mode
         scene_prompt = self._scene_prompt(selection.scene, scene_hint)
         user_prompt = self.prompts.render(
             "scene_photo_user",
@@ -1131,7 +1155,7 @@ class PhotoStudioService:
             "开始请求场景生图服务",
             task_id=task.id,
             stream_id=task.stream_id,
-            mode=self.config.openai.generation_mode,
+            mode=mode,
             model=str(payload.get("model_id") or self.config.openai.generation_model),
             reference_count=len(references),
         )
@@ -1146,7 +1170,7 @@ class PhotoStudioService:
             output_format=self.config.openai.generation_output_format or None,
             moderation=self.config.openai.generation_moderation or None,
             extra=self.config.openai.generation_extra_params or None,
-            mode=self.config.openai.generation_mode,
+            mode=mode,
         )
         if self._task_cancelled(task.id):
             self.payloads.delete(task.id)
@@ -1189,6 +1213,43 @@ class PhotoStudioService:
         # Scene-only photos never backfill outfit/person references.
         await self._deliver(self.storage.get_task(task.id) or task)
 
+    async def _generate_plain_image(self, task: ImageTask) -> None:
+        """任意图片生成：不涉及参考图库，纯文生图，风格完全由需求决定。"""
+
+        payload = self.payloads.get(task.id)
+        description = str(payload.get("description") or payload.get("prompt") or "").strip()
+        if not description:
+            raise PhotoStudioError("图片描述为空")
+        prompt = (
+            "你负责按用户需求生成一张图片。忠实执行需求中指定的内容、风格、构图与配色，"
+            "不要添加任何文字或水印。\n\n"
+            f"用户需求：{description}"
+        ).strip()
+        self.log.info(
+            "开始请求普通生图服务",
+            task_id=task.id,
+            stream_id=task.stream_id,
+            mode=self.config.openai.generation_mode,
+            model=str(payload.get("model_id") or self.config.openai.generation_model),
+        )
+        self.storage.mark_task_request_started(task.id)
+        generated = await self._provider_instance().generate(
+            prompt,
+            images=None,
+            model=str(payload.get("model_id") or "") or None,
+            size=str(payload.get("size") or self.config.openai.generation_size or "") or None,
+            negative_prompt=None,
+            quality=self.config.openai.generation_quality or None,
+            output_format=self.config.openai.generation_output_format or None,
+            moderation=self.config.openai.generation_moderation or None,
+            extra=self.config.openai.generation_extra_params or None,
+            mode=self.config.openai.generation_mode,
+        )
+        if self._task_cancelled(task.id):
+            self.payloads.delete(task.id)
+            return
+        await self._persist_and_deliver(task, generated, {"generation": "image"})
+
     async def _generate_photo(self, task: ImageTask) -> None:
         payload = self.payloads.get(task.id)
         # Re-check after a task has waited in the queue.  An administrator may
@@ -1223,6 +1284,8 @@ class PhotoStudioService:
             references.append(selection.outfit.reference_path.read_bytes())
         if selection.scene is not None:
             references.append(selection.scene.reference_path.read_bytes())
+        # 带参考图时用 reference_mode（方舟走 ark_images），纯文生图才用 generation_mode
+        mode = self.config.openai.reference_mode if references else self.config.openai.generation_mode
         nickname, personality = await self.load_host_identity() if person is None else ("", "")
         person_prompt = self._person_prompt(person, nickname=nickname, personality=personality)
         outfit_prompt = self._outfit_prompt(
@@ -1244,7 +1307,7 @@ class PhotoStudioService:
             "开始请求写真生图服务",
             task_id=task.id,
             stream_id=task.stream_id,
-            mode=self.config.openai.generation_mode,
+            mode=mode,
             model=str(payload.get("model_id") or self.config.openai.generation_model),
             reference_count=len(references),
             person_reference=person.id if person else None,
@@ -1262,7 +1325,7 @@ class PhotoStudioService:
             output_format=self.config.openai.generation_output_format or None,
             moderation=self.config.openai.generation_moderation or None,
             extra=self.config.openai.generation_extra_params or None,
-            mode=self.config.openai.generation_mode,
+            mode=mode,
         )
         if self._task_cancelled(task.id):
             self.payloads.delete(task.id)
